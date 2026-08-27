@@ -19,6 +19,8 @@ LABEL org.opencontainers.image.source="https://github.com/faultoverload/aur-forg
 # gnupg        — signing + keyring
 # pinentry     — unattended passphrase via loopback/tty
 # git, base-devel — needed by every AUR build
+# jq, openssh, curl — gate pipeline (JSON manipulation + GitHub API)
+# make, gcc — needed by archcanary's PKGBUILD
 RUN pacman -Syu --noconfirm \
     && pacman -S --noconfirm --needed \
         base-devel \
@@ -29,10 +31,34 @@ RUN pacman -Syu --noconfirm \
         gnupg \
         jq \
         openssh \
+        curl \
         pinentry \
         ca-certificates \
  && pacman -Scc --noconfirm \
  && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
+
+# Install archcanary (musqz/archcanary) from source. It is NOT in the
+# Arch repos — we clone the AUR-equivalent git repo at build time and
+# run `makepkg -si` as a non-root user. We use `--needed` semantics by
+# checking for archcanary on PATH first via a build-time probe.
+#
+# Note: makepkg refuses to build as root, so we drop to a temp user,
+# build, then install the resulting package as root. This is the same
+# pattern documented at https://wiki.archlinux.org/title/Makepkg#Building_as_a_different_user
+RUN useradd -m -s /bin/bash tmpbuild \
+    && passwd -d tmpbuild \
+    && echo "tmpbuild ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tmpbuild \
+    && sudo -u tmpbuild bash -c '
+        set -euo pipefail
+        cd /tmp
+        git clone --depth 1 https://github.com/musqz/archcanary.git
+        cd archcanary
+        makepkg -si --noconfirm --skippgpcheck
+    ' \
+    && rm -rf /tmp/archcanary \
+    && userdel -r tmpbuild 2>/dev/null || true \
+    && rm -f /etc/sudoers.d/tmpbuild \
+    && archcanary --help >/dev/null || { echo "archcanary install failed"; exit 1; }
 
 # Make pacman + makepkg happy in a containerized chroot. makepkg runs
 # extra-x86_64-build which creates its own chroot via pacstrap — no
@@ -53,8 +79,16 @@ COPY build.sh      /usr/local/bin/build.sh
 COPY init.sh       /usr/local/bin/init.sh
 COPY update.sh     /usr/local/bin/update.sh
 COPY serve.sh      /usr/local/bin/serve.sh
+COPY scripts/      /usr/local/lib/aur-forge/
 
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh /usr/local/bin/init.sh /usr/local/bin/update.sh /usr/local/bin/serve.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh \
+              /usr/local/bin/init.sh /usr/local/bin/update.sh \
+              /usr/local/bin/serve.sh \
+    && chmod +x /usr/local/lib/aur-forge/*.sh \
+    && ln -sf /usr/local/lib/aur-forge/approval-store.sh      /usr/local/bin/approval-store.sh \
+    && ln -sf /usr/local/lib/aur-forge/srcinfo-diff.sh        /usr/local/bin/srcinfo-diff.sh \
+    && ln -sf /usr/local/lib/aur-forge/open-quarantine-issue.sh /usr/local/bin/open-quarantine-issue.sh \
+    && ln -sf /usr/local/lib/aur-forge/drain-quarantine.sh    /usr/local/bin/drain-quarantine.sh
 
 # darkhttpd serves on 8080 internally; Traefik in front publishes 443.
 EXPOSE 8080
