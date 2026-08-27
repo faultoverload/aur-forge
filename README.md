@@ -103,10 +103,54 @@ Edit `pkglist.txt` on bigballs, then either:
 
 ```bash
 docker compose -f /opt/docker/compose/bigballs/production/aur-forge/docker-compose.yml \
-    run --rm aur-forge-build
+    run --rm --profile build aur-forge-build
 ```
 
 …or trigger the Komodo procedure `aur-forge-build` from the UI.
+
+## Nightly upstream-version check
+
+`aur-forge` ships an `update` subcommand that:
+
+1. Reads `pkglist.txt`.
+2. Queries the AUR RPC for each package's current `Version`.
+3. Compares against the version currently in `/repo`.
+4. Rebuilds only the packages whose upstream `Version` differs from what's served.
+5. Skips packages flagged `OutOfDate` by their AUR maintainer (logs a warning instead).
+
+This runs nightly at 3am ET via the `aur-forge-update` Komodo procedure. You can also trigger it manually:
+
+```bash
+docker compose -f /opt/docker/compose/bigballs/production/aur-forge/docker-compose.yml \
+    run --rm --profile build aur-forge-build update
+# or with dry-run:
+docker compose ... run --rm --profile build aur-forge-build update --dry-run
+```
+
+Typical nightly output when nothing changed:
+
+```
+[update] 5 package(s) in pkglist
+[update] upstream summary:
+         need rebuild   : 0 (none)
+         up-to-date    : 4
+         marked OOD    : 1 (visual-studio-code-bin)
+         not in AUR    : 0
+[update] nothing to build — exiting.
+```
+
+When something needs rebuilding:
+
+```
+[update] upstream summary:
+         need rebuild   : 1 (yay)
+         up-to-date    : 3
+         marked OOD    : 1 (visual-studio-code-bin)
+         not in AUR    : 0
+[update] launching build for 1 package(s)
+==== yay ====
+[build] OK: yay
+```
 
 ## Limitations
 

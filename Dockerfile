@@ -27,6 +27,7 @@ RUN pacman -Syu --noconfirm \
         darkhttpd \
         git \
         gnupg \
+        jq \
         openssh \
         pinentry \
         ca-certificates \
@@ -50,9 +51,10 @@ WORKDIR /repo
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY build.sh      /usr/local/bin/build.sh
 COPY init.sh       /usr/local/bin/init.sh
+COPY update.sh     /usr/local/bin/update.sh
 COPY serve.sh      /usr/local/bin/serve.sh
 
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh /usr/local/bin/init.sh /usr/local/bin/serve.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh /usr/local/bin/init.sh /usr/local/bin/update.sh /usr/local/bin/serve.sh
 
 # darkhttpd serves on 8080 internally; Traefik in front publishes 443.
 EXPOSE 8080
