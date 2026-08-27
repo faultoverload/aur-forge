@@ -1,0 +1,47 @@
+# Sample compose — for local development / one-off testing.
+# Production deploys go through Komodo from faultoverload/docker, where
+# the prod compose file lives at compose/bigballs/production/aur-forge/.
+name: aur-forge-sample
+
+services:
+  aur-forge-build:
+    build: .
+    image: localhost/aur-forge:latest
+    container_name: aur-forge-build
+    init: true        # proper signal handling for makepkg/extra-x86_64-build
+    cap_add:
+      - SYS_ADMIN     # pacstrap/mount inside the build chroot
+      - MKNOD
+    security_opt:
+      - apparmor=unconfined
+    environment:
+      REPO_NAME: custom
+      REPO_OWNER: faultoverload
+      REPO_EMAIL: woodsyx@gmail.com
+    volumes:
+      # Bind-mount these from the host so state survives container rebuilds.
+      - ./pkglist.txt:/pkglist:ro
+      - aur-forge-repo:/repo
+      - aur-forge-cache:/cache
+      - aur-forge-keys:/keys
+    profiles: ["build", "default"]
+
+  aur-forge-serve:
+    image: localhost/aur-forge:latest
+    container_name: aur-forge-serve
+    depends_on:
+      - aur-forge-build
+    environment:
+      REPO_NAME: custom
+      PORT: "8080"
+    volumes:
+      - aur-forge-repo:/repo:ro
+      - aur-forge-keys:/keys:ro
+    ports:
+      - "8080:8080"
+    profiles: ["serve"]
+
+volumes:
+  aur-forge-repo:
+  aur-forge-cache:
+  aur-forge-keys:

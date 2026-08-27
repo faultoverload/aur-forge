@@ -1,0 +1,13 @@
+# aur-forge pkglist — one AUR package name per line.
+# Lines starting with '#' and blank lines are ignored.
+#
+# Add packages you want compiled and hosted in your custom pacman repo.
+# After editing this file, run:
+#   docker compose run --rm aur-forge build
+
+# Example entries — replace or extend:
+# ungoogled-chromium-bin
+# spotify
+# visual-studio-code-bin
+# obsidian
+# slack-desktop
