@@ -41,7 +41,9 @@ Usage:
                             --dry-run     : show what would be done
   aur-forge run             24/7 service mode: serves /repo via darkhttpd
                             AND runs the nightly sequence at NIGHTLY_AT
-                            (default 03:00, in container's TZ).
+                            (default 03:00, in container's TZ). run.sh
+                            invokes init.sh first, so the container is
+                            self-bootstrapping (no separate init step).
   aur-forge help            This message.
 
 State directories (bind-mount these from the host):

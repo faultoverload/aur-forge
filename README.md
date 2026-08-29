@@ -116,6 +116,12 @@ Schedule is driven by an in-container bash loop — no cron daemon
 needed. The loop honors SIGTERM within ~60 seconds and the whole
 container exits cleanly when Komodo stops it.
 
+On every container start, `run.sh` invokes `init.sh` first, which
+generates the GPG signing key (once) and seeds the repo skeleton.
+After the first deploy, `init.sh` short-circuits via the
+`/keys/trusted-key.fpr` check and adds ~1 ms to startup. Rotate the
+key by `rm -rf /opt/docker/data/aur-forge/keys/*` + restart.
+
 ### Knobs
 
 - `NIGHTLY_AT=HH:MM` — local (TZ) time the nightly sequence runs.
@@ -163,25 +169,44 @@ auto-approving them.
 
 Production deploy uses Komodo from the `faultoverload/docker` repo. The PR there adds:
 
-- `compose/bigballs/production/aur-forge/docker-compose.yml`
-  - bind-mounts `/opt/docker/data/aur-forge/approvals` to `/approvals` so the
-    approval JSON store survives container rebuilds
-- A build entry in `komodo.toml` (image built on bigballs-builder)
+- `compose/bigballs/production/aur-forge.yml`
+  - single `aur-forge` service running in 24/7 `run` mode
+  - bind-mounts `/opt/docker/data/aur-forge/{repo,cache,keys,approvals}` so
+    all persistent state survives container rebuilds
+- A build entry in `komodo.toml` (image built on bigballs-builder,
+  tagged `localhost/aur-forge:latest`)
 - A stack entry (`aur-forge` deploys the running container)
 - A repo entry (Komodo tracks `faultoverload/aur-forge`)
-- A procedure (`aur-forge-init` for first-time setup)
-- A schedule (`aur-forge-drain` every 15 minutes)
 
-For local development / smoke tests, use the bundled `docker-compose.sample.yml`:
+**First deploy only:** pre-create the host-side data dirs so the
+volume binds succeed:
+
+```bash
+ssh diana@bigballs
+sudo mkdir -p /opt/docker/data/aur-forge/{repo,cache,keys,approvals}
+sudo chmod 700 /opt/docker/data/aur-forge/keys
+sudo touch /opt/docker/data/aur-forge/pkglist.txt
+sudo chown -R diana:diana /opt/docker/data/aur-forge
+exit
+```
+
+After that, `run` mode is self-bootstrapping: on every container
+start, `run.sh` invokes `init.sh` which short-circuits if the GPG key
+already exists (or generates one if it doesn't), exports the pubkey
+to `/keys/aur-forge.pub`, and seeds the repo skeleton. **No separate
+init step needed.**
+
+For local development / smoke tests, use the bundled `docker-compose.sample.yml`
+(still two-service for the dev loop, where iterating on `build` without
+needing the nightly scheduler is convenient):
 
 ```bash
 git clone https://github.com/faultoverload/aur-forge
 cd aur-forge
 cp pkglist.txt.example pkglist.txt   # edit to taste
-docker compose --profile build run --rm aur-forge-build build --dry-run
-docker compose --profile build run --rm aur-forge-build init
-docker compose --profile build run --rm aur-forge-build build
-docker compose --profile serve up -d aur-forge-serve
+docker compose -f docker-compose.sample.yml --profile build run --rm aur-forge-build init
+docker compose -f docker-compose.sample.yml --profile build run --rm aur-forge-build build
+docker compose -f docker-compose.sample.yml --profile serve up -d aur-forge-serve
 ```
 
 ## Onboarding a client

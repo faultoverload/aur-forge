@@ -30,6 +30,15 @@ NIGHTLY_AT="${NIGHTLY_AT:-03:00}"
 LOG_TAG="[$(date -u +%FT%TZ)]"
 
 # ---------------------------------------------------------------------
+# Idempotent bootstrap: generate the GPG signing key (once) + seed the
+# repo skeleton, every time the container starts. Safe because init.sh
+# short-circuits when the key already exists in /keys/trusted-key.fpr.
+# After first deploy the bootstrap adds ~1ms (keygen check + gpg
+# --export). On first deploy or after a key rotation it adds ~3-5s.
+# ---------------------------------------------------------------------
+/usr/local/bin/init.sh
+
+# ---------------------------------------------------------------------
 # Subprocess plumbing
 # ---------------------------------------------------------------------
 DARKHTTD_PID=""
