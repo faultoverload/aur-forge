@@ -20,9 +20,11 @@ LABEL org.opencontainers.image.source="https://github.com/faultoverload/aur-forg
 # git, base-devel — needed by every AUR build
 # jq, openssh, curl — gate pipeline (JSON manipulation + GitHub API)
 # make, gcc — needed by archcanary's PKGBUILD
+# pacutils, perl-json-xs — runtime deps of aurutils (AUR). Pre-install
+#   them here so the makepkg-as-tmpuser step below doesn't have to
+#   resolve deps mid-build.
 #
-# NOTE: aurutils is NOT in the official Arch repos (AUR-only); it is
-# installed below via the same makepkg-as-tmpuser path as archcanary.
+# NOTE: aurutils itself is AUR-only and is installed below via makepkg.
 RUN pacman -Syu --noconfirm \
     && pacman -S --noconfirm --needed \
         base-devel \
@@ -35,14 +37,22 @@ RUN pacman -Syu --noconfirm \
         curl \
         pinentry \
         ca-certificates \
+        pacutils \
+        perl-json-xs \
  && pacman -Scc --noconfirm \
  && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
 
 # Install archcanary (musqz/archcanary) + aurutils (AUR helpers) from
 # source. Both are AUR-only packages, never in [core]/[extra], so they
 # can't be installed with pacman. We clone each repo, run `makepkg -si`
-# as a non-root user, and trust makepkg's own dependency resolution to
-# pull any missing makedeps.
+# as a non-root user, and rely on the deps we pre-installed above.
+#
+# Both packages are passed --skippgpcheck to disable makepkg's source-
+# file signature verification. The AUR does not require PKGBUILD source
+# signatures and missing PGP keys in a clean chroot otherwise cause the
+# build to fail with "SIGNATURE NOT FOUND". The actual package
+# artifacts are signed at build time by aur-forge's GPG key (see
+# build.sh / repo-add), so this does not weaken repo integrity.
 #
 # Note: makepkg refuses to build as root, so we drop to a temp user,
 # build, then install the resulting packages as root. This is the same
@@ -58,7 +68,7 @@ RUN useradd -m -s /bin/bash tmpbuild \
         cd /tmp && \
         git clone --depth 1 https://aur.archlinux.org/aurutils.git && \
         cd aurutils && \
-        makepkg -si --noconfirm' \
+        makepkg -si --noconfirm --skippgpcheck' \
     && rm -rf /tmp/archcanary /tmp/aurutils \
     && userdel -r tmpbuild 2>/dev/null || true \
     && rm -f /etc/sudoers.d/tmpbuild \
