@@ -28,11 +28,13 @@ APPROVALS_DIR="${APPROVALS_DIR:-/approvals}"
 STRICT_FIRST_BUILD="${STRICT_FIRST_BUILD:-0}"
 
 DRY_RUN=0
+SCAN_ONLY=0
 ONLY_PKG=""
 for arg in "$@"; do
     case "$arg" in
         -n|--dry-run) DRY_RUN=1 ;;
-        --only=*)      ONLY_PKG="${arg#*=}" ;;
+        --scan-only)  SCAN_ONLY=1 ;;
+        --only=*)     ONLY_PKG="${arg#*=}" ;;
         *) echo "Unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -464,6 +466,14 @@ for pkg in "${PKGS[@]}"; do
     if ! run_gate "$pkg" "$WORK"; then
         QUARANTINED=$((QUARANTINED+1))
         # run_gate moves $WORK to /cache/work-quarantine/<pkg>-<pid>.
+        continue
+    fi
+
+    # --scan-only: clone + gate + approve only. Don't actually build.
+    if [[ "$SCAN_ONLY" -eq 1 ]]; then
+        echo "[scan-only] $pkg: gate passed, skipping chroot build"
+        cd / && rm -rf "$WORK"
+        SKIPPED=$((SKIPPED+1))
         continue
     fi
 

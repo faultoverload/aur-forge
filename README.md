@@ -96,21 +96,56 @@ A reviewer triages a quarantine issue by adding **one** label:
 Issues without a decision label are left open and skipped. No automatic
 rebuild happens until a human adds the `quarantine/approved` label.
 
+## 24/7 service mode
+
+The default deployment runs the container in `run` mode — it serves
+`/repo` continuously via darkhttpd AND runs the full nightly sequence
+in the background:
+
+1. **AUR-RPC diff scan** — rebuild only packages whose upstream Version
+   differs from what's already in `/repo`. Skips OutOfDate.
+2. **archcanary re-scan** — clone every package in `/pkglist`, run the
+   archcanary blocklist + PKGBUILD-diff gate. Any drift from the stored
+   approval opens a quarantine Issue. Build itself is skipped
+   (`--scan-only`); only the gates fire.
+3. **drain-quarantine** — act on open GitHub Issues labeled
+   `approved` (rebuild + refresh hash) or `rejected` (delete the
+   cloned tree, never build).
+
+Schedule is driven by an in-container bash loop — no cron daemon
+needed. The loop honors SIGTERM within ~60 seconds and the whole
+container exits cleanly when Komodo stops it.
+
+### Knobs
+
+- `NIGHTLY_AT=HH:MM` — local (TZ) time the nightly sequence runs.
+  Default `03:00`.
+- `TZ=America/New_York` — required for `NIGHTLY_AT` to be in your local
+  timezone. The container image itself doesn't set `TZ`; the compose
+  file does (see `faultoverload/docker`).
+- `GITHUB_TOKEN=<PAT>` — required for filing / draining quarantine
+  Issues. Without it, the build loop still proceeds but quarantine
+  events are logged to stderr only.
+- `STRICT_FIRST_BUILD=1` — quarantine every first build of every
+  package (instead of auto-approving after a clean scan). Useful when
+  you're bootstrapping a fresh `/pkglist` and want human eyes on each
+  new approval.
+
 ## Drain procedure
 
-`scripts/drain-quarantine.sh` walks the `quarantine/blocked` label set and
-acts on the decision labels above. It is designed to run from a Komodo
-procedure every 15 minutes, or on-demand:
+`scripts/drain-quarantine.sh` walks the `quarantine/*` label set and
+acts on the decision labels above. In the 24/7 run-mode deployment
+it is invoked automatically by the scheduler at `NIGHTLY_AT`. For
+manual one-shot use (e.g. during initial setup):
 
 ```bash
 # In-container:
 docker compose -f /opt/docker/compose/bigballs/production/aur-forge/docker-compose.yml \
-    run --rm aur-forge drain --dry-run   # see what would happen
-docker compose ... run --rm aur-forge drain        # actually rebuild / discard
+    exec aur-forge drain --dry-run   # see what would happen
+docker compose ... exec aur-forge drain        # actually rebuild / discard
 ```
 
-For the Komodo side, see `faultoverload/docker` repo (PR builds on top of
-#90).
+For the Komodo side, see `faultoverload/docker` repo (PR #90).
 
 ## First-build grandfathering
 

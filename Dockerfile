@@ -79,11 +79,12 @@ COPY build.sh      /usr/local/bin/build.sh
 COPY init.sh       /usr/local/bin/init.sh
 COPY update.sh     /usr/local/bin/update.sh
 COPY serve.sh      /usr/local/bin/serve.sh
+COPY run.sh        /usr/local/bin/run.sh
 COPY scripts/      /usr/local/lib/aur-forge/
 
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh \
               /usr/local/bin/init.sh /usr/local/bin/update.sh \
-              /usr/local/bin/serve.sh \
+              /usr/local/bin/serve.sh /usr/local/bin/run.sh \
     && chmod +x /usr/local/lib/aur-forge/*.sh \
     && ln -sf /usr/local/lib/aur-forge/approval-store.sh      /usr/local/bin/approval-store.sh \
     && ln -sf /usr/local/lib/aur-forge/srcinfo-diff.sh        /usr/local/bin/srcinfo-diff.sh \
