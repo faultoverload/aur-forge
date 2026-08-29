@@ -52,12 +52,21 @@ fi
 gpg --export --armor "${REPO_EMAIL}" > /keys/aur-forge.pub
 chmod 0644 /keys/aur-forge.pub
 
-# Seed the repo directory + initial db file if absent. The .db.tar.zst
-# file gets re-created by repo-add on first build; this just makes the
-# served path exist for clients.
-mkdir -p "/repo/${REPO_NAME}.x86_64"
-touch "/repo/${REPO_NAME}.x86_64/${REPO_NAME}.db"
-touch "/repo/${REPO_NAME}.x86_64/${REPO_NAME}.files"
+# Expose the pubkey through darkhttpd's served root (/repo). darkhttpd
+# is rooted at /repo and cannot serve /keys directly because /keys is a
+# separate bind mount; symlinking the pubkey into the repo tree lets
+# clients fetch https://aur-forge.gateslab.win/keys/aur-forge.pub for
+# `pacman-key --add` and pacman-key --lsign. The /repo mount is RW in
+# the compose spec so this symlink survives across runs. We point at
+# /keys/aur-forge.pub (the source of truth) rather than copy, so key
+# rotations are reflected immediately on the next init.
+mkdir -p "/repo/keys"
+ln -sf /keys/aur-forge.pub "/repo/keys/aur-forge.pub"
+
+# Seed the repo directory. Do NOT touch .db / .files placeholders —
+# repo-add creates them on the first real build, and a 0-byte .db
+# served to clients will cause pacman to error parsing it. darkhttpd
+# runs with --no-listing so the empty directory is harmless.
 
 echo "[init] ready."
 echo "       pubkey: /keys/aur-forge.pub"
