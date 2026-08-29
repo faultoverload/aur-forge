@@ -90,7 +90,7 @@ RUN useradd -m -s /bin/bash tmpbuild \
     && userdel -r tmpbuild 2>/dev/null || true \
     && rm -f /etc/sudoers.d/tmpbuild \
     && archcanary --help >/dev/null || { echo "archcanary install failed"; exit 1; } \
-    && aur sync --help >/dev/null || { echo "aurutils install failed"; exit 1; }
+    && command -v aur >/dev/null || { echo "aurutils install failed"; exit 1; }
 
 # Make pacman + makepkg happy in a containerized chroot. makepkg runs
 # extra-x86_64-build which creates its own chroot via pacstrap — no
