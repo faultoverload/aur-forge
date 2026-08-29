@@ -48,13 +48,11 @@ RUN pacman -Syu --noconfirm \
 RUN useradd -m -s /bin/bash tmpbuild \
     && passwd -d tmpbuild \
     && echo "tmpbuild ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tmpbuild \
-    && sudo -u tmpbuild bash -c '
-        set -euo pipefail
-        cd /tmp
-        git clone --depth 1 https://github.com/musqz/archcanary.git
-        cd archcanary
-        makepkg -si --noconfirm --skippgpcheck
-    ' \
+    && sudo -u tmpbuild bash -c 'set -euo pipefail; \
+        cd /tmp && \
+        git clone --depth 1 https://github.com/musqz/archcanary.git && \
+        cd archcanary && \
+        makepkg -si --noconfirm --skippgpcheck' \
     && rm -rf /tmp/archcanary \
     && userdel -r tmpbuild 2>/dev/null || true \
     && rm -f /etc/sudoers.d/tmpbuild \
