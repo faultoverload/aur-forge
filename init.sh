@@ -52,6 +52,12 @@ fi
 gpg --export --armor "${REPO_EMAIL}" > /keys/aur-forge.pub
 chmod 0644 /keys/aur-forge.pub
 
+# systemd-nspawn (called by arch-nspawn inside extra-x86_64-build)
+# refuses to start without /etc/machine-id. archlinux:latest doesn't
+# ship one. Idempotent: systemd-machine-id-setup is a no-op if the
+# file already exists.
+[[ -f /etc/machine-id ]] || systemd-machine-id-setup
+
 # Expose the pubkey through darkhttpd's served root (/repo). darkhttpd
 # is rooted at /repo and cannot serve /keys directly because /keys is a
 # separate bind mount; symlinking the pubkey into the repo tree lets
@@ -109,9 +115,22 @@ if [[ ! -f "${CHROOT_ROOT}/usr/bin/pacman" ]]; then
         base base-devel >/tmp/init-chroot.log 2>&1 \
       || { echo "[init] chroot bootstrap failed — see /tmp/init-chroot.log"; tail -20 /tmp/init-chroot.log; rm -f "${TMP_PC}"; exit 1; }
     rm -f "${TMP_PC}"
+    # arch-nspawn sanity-checks for this marker file; without it every
+    # extra-x86_64-build dies with "'root' does not appear to be an
+    # Arch chroot." even though the directory is fully populated.
+    # CHROOT_VERSION is hardcoded in devtools' lib/archroot.sh — keep
+    # it in sync if devtools ever bumps it.
+    echo "v6" > "${CHROOT_ROOT}/.arch-chroot"
     echo "[init] chroot ready."
 else
     echo "[init] chroot already populated at ${CHROOT_ROOT}"
+    # Ensure the .arch-chroot marker exists even on pre-existing
+    # chroots (e.g. one bootstrapped by older init.sh that didn't
+    # write the marker, or a chroot copied in from elsewhere).
+    if [[ ! -f "${CHROOT_ROOT}/.arch-chroot" ]]; then
+        echo "v6" > "${CHROOT_ROOT}/.arch-chroot"
+        echo "[init] wrote missing .arch-chroot marker"
+    fi
 fi
 
 echo "[init] ready."
