@@ -13,6 +13,19 @@ LABEL org.opencontainers.image.title="aur-forge"
 LABEL org.opencontainers.image.description="Containerized AUR build farm — builds AUR packages in clean chroots and serves a signed custom pacman repo."
 LABEL org.opencontainers.image.source="https://github.com/faultoverload/aur-forge"
 
+# Disable pacman's DownloadUser sandbox. Pacman 7+ sandboxes downloads
+# under the unprivileged `alpm` user with landlock + seccomp. The default
+# Docker seccomp profile blocks the syscalls landlock needs, so the
+# sandbox fails to start and pacman errors out with:
+#   "error restricting syscalls via seccomp: 22"
+#   "error switching to sandbox user 'alpm' failed"
+# Building aur-forge's container as --privileged or with a custom
+# seccomp profile would also work, but the sandbox is purely a defense-
+# in-depth feature for download extraction; it provides no value inside
+# a build container we're already running as root. Disable it globally
+# so every subsequent pacman / makepkg call inherits the setting.
+RUN sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf
+
 # devtools     — extra-x86_64-build (clean chroot builds)
 # darkhttpd    — static file server for the repo
 # gnupg        — signing + keyring
