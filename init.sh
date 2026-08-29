@@ -68,6 +68,52 @@ ln -sf /keys/aur-forge.pub "/repo/keys/aur-forge.pub"
 # served to clients will cause pacman to error parsing it. darkhttpd
 # runs with --no-listing so the empty directory is harmless.
 
+# ---------------------------------------------------------------------
+# Bootstrap the devtools chroot the first time the container starts.
+# ---------------------------------------------------------------------
+# extra-x86_64-build (called by build.sh) refuses to run unless
+# /var/lib/archbuild/extra-x86_64/root already looks like an Arch
+# chroot. On first invocation it tries to populate that directory by
+# calling `pacman -Sy` inside a `unshare --fork --pid` namespace. In a
+# Docker container that namespace breaks the GPG signature path: every
+# package comes back with "missing required signature" because the
+# gpg-agent socket / keyring files are unreachable from the namespaced
+# process. Verified locally — `pacstrap` (which uses the same unshare)
+# fails the same way; direct `pacman -Sy -r` without unshare works.
+#
+# Workaround: bootstrap the chroot ourselves using plain `pacman -Sy
+# -r`, which doesn't enter a namespace and so keeps the keyring
+# reachable. After this populates /var/lib/archbuild/extra-x86_64/root,
+# extra-x86_64-build sees a valid chroot on subsequent calls and skips
+# its own (broken) bootstrap. This is idempotent: if the chroot is
+# already populated, we no-op.
+# ---------------------------------------------------------------------
+CHROOT_ROOT="/var/lib/archbuild/extra-x86_64/root"
+if [[ ! -f "${CHROOT_ROOT}/usr/bin/pacman" ]]; then
+    echo "[init] bootstrapping devtools chroot at ${CHROOT_ROOT}"
+    # Pacstrap's temp pacman.conf tweaks DownloadUser (the alpm
+    # download sandbox) — Docker's default seccomp profile blocks the
+    # syscalls it needs. Mirror that tweak here so the bootstrapped
+    # chroot has the same setting pacstrap would have produced.
+    TMP_PC="$(mktemp /tmp/pacman.conf.XXXX)"
+    cp /etc/pacman.conf "${TMP_PC}"
+    sed -i 's/^DownloadUser/#&/' "${TMP_PC}"
+    mkdir -p "${CHROOT_ROOT}/var/lib/pacman" \
+             "${CHROOT_ROOT}/var/cache/pacman/pkg"
+    pacman -Sy --noconfirm \
+        -r "${CHROOT_ROOT}" \
+        -b "${CHROOT_ROOT}/var/lib/pacman" \
+        --cachedir="${CHROOT_ROOT}/var/cache/pacman/pkg/" \
+        --config="${TMP_PC}" \
+        --disable-sandbox \
+        base base-devel >/tmp/init-chroot.log 2>&1 \
+      || { echo "[init] chroot bootstrap failed — see /tmp/init-chroot.log"; tail -20 /tmp/init-chroot.log; rm -f "${TMP_PC}"; exit 1; }
+    rm -f "${TMP_PC}"
+    echo "[init] chroot ready."
+else
+    echo "[init] chroot already populated at ${CHROOT_ROOT}"
+fi
+
 echo "[init] ready."
 echo "       pubkey: /keys/aur-forge.pub"
 echo "       repo:   /repo/${REPO_NAME}.x86_64/"

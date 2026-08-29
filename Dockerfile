@@ -97,6 +97,17 @@ RUN useradd -m -s /bin/bash tmpbuild \
 # systemd / no kernel needed, but we do need /etc/mtab and unshare caps.
 RUN ln -sf /proc/self/mounts /etc/mtab
 
+# Initialize + populate the pacman keyring at build time. Without this,
+# the first `extra-x86_64-build` invocation triggers `pacman -Sy` inside
+# the new chroot and every package fails PGP signature verification
+# ("missing required signature") because the trust database is empty.
+# archlinux:latest ships with the keyring files but no trust signatures
+# applied — pacman-key --populate is what makes the master keys trusted.
+RUN pacman-key --init \
+ && pacman-key --populate archlinux \
+ && pacman -Sy --noconfirm \
+ && rm -rf /var/lib/pacman/sync/*
+
 # Build a non-root user for makepkg (makepkg refuses to run as root by
 # default). The container's entrypoint runs as root and drops to this user
 # for the build itself; signed packages get copied out as root.
