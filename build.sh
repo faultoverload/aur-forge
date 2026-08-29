@@ -479,7 +479,14 @@ for pkg in "${PKGS[@]}"; do
 
     # Build in a clean chroot.
     cd "$WORK"
-    if ! sudo -u builder extra-x86_64-build --no-check 2>/tmp/build.err; then
+    # NOTE: do NOT pass --no-check here. devtools < 1.2.0 doesn't
+    # support it (illegal option -- ---), and the package list shipped
+    # here (neofetch, plex-media-player, hermes-agent-desktop) has no
+    # check() functions to skip anyway. If we later need to skip
+    # check() on packages that have it, prefer MAKEFLAGS="-nocheck"
+    # or a makepkg.conf drop-in rather than threading an unsupported
+    # flag through every invocation.
+    if ! sudo -u builder extra-x86_64-build 2>/tmp/build.err; then
         echo "[build] FAILED to build $pkg:" >&2
         tail -50 /tmp/build.err >&2
         FAILED=$((FAILED+1))
