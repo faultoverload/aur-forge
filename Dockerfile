@@ -30,6 +30,9 @@ RUN sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf
 # darkhttpd    — static file server for the repo
 # gnupg        — signing + keyring
 # pinentry     — unattended passphrase via loopback/tty
+# sudo         — makepkg refuses to build as root; we drop to a temp
+#                user via `sudo -u tmpbuild` for the AUR package build.
+#                archlinux:latest (= `base` meta) does NOT ship sudo.
 # git, base-devel — needed by every AUR build
 # jq, openssh, curl — gate pipeline (JSON manipulation + GitHub API)
 # make, gcc — needed by archcanary's PKGBUILD
@@ -42,6 +45,7 @@ RUN pacman -Syu --noconfirm \
     && pacman -S --noconfirm --needed \
         base-devel \
         devtools \
+        sudo \
         darkhttpd \
         git \
         gnupg \
