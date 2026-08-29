@@ -23,6 +23,11 @@ if [[ -s "$KEY_FPR_FILE" ]] && gpg --list-secret-keys "$GPG_KEY_NAME" >/dev/null
 else
     echo "[init] generating new GPG signing key (no passphrase — homelab use)"
     # Unattended keygen: batch mode + empty passphrase via loopback pinentry.
+    # NOTE: don't use --quick-gen-key with "ed25519" — GnuPG 2.4.x returns
+    # "Unknown elliptic curve" because ed25519 isn't registered as a
+    # standalone curve name in the parser. The batch-file form
+    # (Key-Type: EDDSA + Key-Curve: ed25519) is the documented and
+    # working spec.
     export PINENTRY_USER_DATA="loopback"
     cat > /tmp/gen-key.batch <<EOF
 %no-protection
@@ -36,12 +41,8 @@ Expire-Date: 0
 %commit
 EOF
     gpg --batch --pinentry-mode loopback --passphrase '' \
-        --quick-gen-key "${GPG_KEY_NAME} ed25519 sign never" \
-        "${REPO_EMAIL}"
-    # Some gpg versions don't accept the combined UID spec above; fall back.
-    if ! gpg --list-secret-keys "$GPG_KEY_NAME" >/dev/null 2>&1; then
-        gpg --batch --pinentry-mode loopback --generate-key /tmp/gen-key.batch
-    fi
+        --generate-key /tmp/gen-key.batch
+    rm -f /tmp/gen-key.batch
     FPR="$(gpg --list-secret-keys --with-colons "$GPG_KEY_NAME" | awk -F: '/^fpr:/ {print $10; exit}')"
     echo "$FPR" > "$KEY_FPR_FILE"
     echo "[init] generated key, fingerprint: $FPR"
