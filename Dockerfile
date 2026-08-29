@@ -14,18 +14,19 @@ LABEL org.opencontainers.image.description="Containerized AUR build farm — bui
 LABEL org.opencontainers.image.source="https://github.com/faultoverload/aur-forge"
 
 # devtools     — extra-x86_64-build (clean chroot builds)
-# aurutils     — aur sync / aur search helpers
 # darkhttpd    — static file server for the repo
 # gnupg        — signing + keyring
 # pinentry     — unattended passphrase via loopback/tty
 # git, base-devel — needed by every AUR build
 # jq, openssh, curl — gate pipeline (JSON manipulation + GitHub API)
 # make, gcc — needed by archcanary's PKGBUILD
+#
+# NOTE: aurutils is NOT in the official Arch repos (AUR-only); it is
+# installed below via the same makepkg-as-tmpuser path as archcanary.
 RUN pacman -Syu --noconfirm \
     && pacman -S --noconfirm --needed \
         base-devel \
         devtools \
-        aurutils \
         darkhttpd \
         git \
         gnupg \
@@ -37,13 +38,14 @@ RUN pacman -Syu --noconfirm \
  && pacman -Scc --noconfirm \
  && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
 
-# Install archcanary (musqz/archcanary) from source. It is NOT in the
-# Arch repos — we clone the AUR-equivalent git repo at build time and
-# run `makepkg -si` as a non-root user. We use `--needed` semantics by
-# checking for archcanary on PATH first via a build-time probe.
+# Install archcanary (musqz/archcanary) + aurutils (AUR helpers) from
+# source. Both are AUR-only packages, never in [core]/[extra], so they
+# can't be installed with pacman. We clone each repo, run `makepkg -si`
+# as a non-root user, and trust makepkg's own dependency resolution to
+# pull any missing makedeps.
 #
 # Note: makepkg refuses to build as root, so we drop to a temp user,
-# build, then install the resulting package as root. This is the same
+# build, then install the resulting packages as root. This is the same
 # pattern documented at https://wiki.archlinux.org/title/Makepkg#Building_as_a_different_user
 RUN useradd -m -s /bin/bash tmpbuild \
     && passwd -d tmpbuild \
@@ -52,11 +54,16 @@ RUN useradd -m -s /bin/bash tmpbuild \
         cd /tmp && \
         git clone --depth 1 https://github.com/musqz/archcanary.git && \
         cd archcanary && \
-        makepkg -si --noconfirm --skippgpcheck' \
-    && rm -rf /tmp/archcanary \
+        makepkg -si --noconfirm --skippgpcheck && \
+        cd /tmp && \
+        git clone --depth 1 https://aur.archlinux.org/aurutils.git && \
+        cd aurutils && \
+        makepkg -si --noconfirm' \
+    && rm -rf /tmp/archcanary /tmp/aurutils \
     && userdel -r tmpbuild 2>/dev/null || true \
     && rm -f /etc/sudoers.d/tmpbuild \
-    && archcanary --help >/dev/null || { echo "archcanary install failed"; exit 1; }
+    && archcanary --help >/dev/null || { echo "archcanary install failed"; exit 1; } \
+    && aur sync --help >/dev/null || { echo "aurutils install failed"; exit 1; }
 
 # Make pacman + makepkg happy in a containerized chroot. makepkg runs
 # extra-x86_64-build which creates its own chroot via pacstrap — no
