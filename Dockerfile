@@ -80,7 +80,7 @@ RUN useradd -m -s /bin/bash tmpbuild \
     && sudo -u tmpbuild bash -c 'set -euo pipefail; \
         cd /tmp && \
         git clone --depth 1 https://github.com/musqz/archcanary.git && \
-        cd archcanary && \
+        cd archcanary/packaging && \
         makepkg -si --noconfirm --skippgpcheck && \
         cd /tmp && \
         git clone --depth 1 https://aur.archlinux.org/aurutils.git && \
