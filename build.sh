@@ -49,6 +49,15 @@ REPO_DIR="/repo/${REPO_NAME}.x86_64"
 mkdir -p "$REPO_DIR" /cache /cache/work "$APPROVALS_DIR"
 chmod 700 /keys 2>/dev/null || true
 
+# /cache/work is where makepkg (running as the `builder` user via
+# `sudo -u builder extra-x86_64-build`) downloads package sources.
+# It's bind-mounted from the host, where root owns it, so without
+# the chown below every build dies with:
+#   ERROR: You do not have write permission for the directory
+#          $SRCDEST (/cache/work/<pkg>).
+# chown it once at startup. Safe to re-run — idempotent.
+chown builder:builder /cache /cache/work 2>/dev/null || true
+
 # archcanary on PATH?
 if ! command -v archcanary >/dev/null 2>&1; then
     echo "[build] WARNING: archcanary not on PATH — blocklist check will be skipped" >&2
