@@ -108,16 +108,11 @@ RUN pacman-key --init \
  && pacman -Sy --noconfirm \
  && rm -rf /var/lib/pacman/sync/*
 
-# Generate a stable machine-id at build time so systemd-as-PID-1
-# doesn't re-roll one on every container start. We use systemd's own
-# machine-id-setup binary because it picks the same UUID format /
-# generation source as a real systemd boot would, keeping logs
-# consistent if anything ever reads machine-id off the image.
-# `systemd-machine-id-setup` requires systemd to be installed; we
-# install it as part of the pacman-key block below and run setup
-# here in the same layer.
-RUN SYSTEMD_UUID="$(cat /proc/sys/kernel/random/uuid)" \
- && printf '%s' "${SYSTEMD_UUID}" > /etc/machine-id
+# /etc/machine-id stays as the archlinux:latest placeholder for now;
+# systemd will overwrite it with a real UUID at first boot. We tried
+# pre-generating one with `cat /proc/sys/kernel/random/uuid` but
+# /proc isn't always available in the Docker build context — leaving
+# systemd to handle it is simpler.
 
 # Build a non-root user for makepkg (makepkg refuses to run as root by
 # default). The container's entrypoint runs as root and drops to this user

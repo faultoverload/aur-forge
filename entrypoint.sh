@@ -28,7 +28,13 @@ case "$CMD" in
         # behavior (init.sh bootstrap, darkhttpd, nightly scheduler,
         # SIGTERM forwarding) — systemd just becomes the parent that
         # restarts it on crash and captures its logs.
-        exec /sbin/init
+        #
+        # Pass --system explicitly. Without it, systemd's container
+        # detection can pick up user-session-like env vars (XDG_RUNTIME_DIR
+        # from the bind mounts, HOME=/root from the docker user, etc.)
+        # and dispatch into MANAGER_USER mode, which then dies with
+        # "Explicit --user argument required to run as user manager."
+        exec /sbin/init --system
         ;;
     init)   exec /usr/local/bin/init.sh             "$@" ;;
     build)  exec /usr/local/bin/build.sh            "$@" ;;
