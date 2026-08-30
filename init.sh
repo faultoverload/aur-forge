@@ -133,6 +133,28 @@ else
     fi
 fi
 
+# Populate the chroot's pacman keyring. extra-x86_64-build runs
+# pacman inside the chroot to install missing build-time
+# dependencies (e.g. electron42, git, libnotify for hermes-agent-
+# desktop). pacman downloads and verifies signatures against
+# /etc/pacman.d/gnupg inside the chroot, and that directory
+# doesn't exist on a freshly bootstrapped chroot — every build dies
+# with:
+#   warning: Public keyring not found; have you run 'pacman-key --init'?
+#   error: keyring is not writable
+# Bind-mount a host keyring in rather than running pacman-key
+# inside the chroot — `unshare --fork --pid` (which pacman-key would
+# invoke via gpg-agent) is blocked by Docker's seccomp profile.
+if [[ ! -d "${CHROOT_ROOT}/etc/pacman.d/gnupg" ]] || \
+   [[ ! -f "${CHROOT_ROOT}/etc/pacman.d/gnupg/gpg.conf" ]]; then
+    if [[ -d /etc/pacman.d/gnupg ]]; then
+        echo "[init] seeding chroot keyring from /etc/pacman.d/gnupg"
+        cp -a /etc/pacman.d/gnupg "${CHROOT_ROOT}/etc/pacman.d/gnupg"
+    else
+        echo "[init] WARNING: host keyring missing; chroot builds will fail to verify signatures"
+    fi
+fi
+
 echo "[init] ready."
 echo "       pubkey: /keys/aur-forge.pub"
 echo "       repo:   /repo/${REPO_NAME}.x86_64/"
