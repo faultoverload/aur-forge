@@ -488,6 +488,15 @@ for pkg in "${PKGS[@]}"; do
 
     # Build in a clean chroot.
     cd "$WORK"
+    # extra-x86_64-build runs as the `builder` user (uid 1000) but
+    # the git-cloned work dir was just created by root, so its files
+    # are owned by root and builder can't write to them. chown the
+    # whole work tree before invoking the build. makepkg inside the
+    # chroot also writes to $SRCDEST here, so without this every
+    # build dies with:
+    #   ERROR: You do not have write permission for the directory
+    #          $SRCDEST (/cache/work/<pkg>).
+    chown -R builder:builder "$WORK"
     # NOTE: do NOT pass --no-check here. devtools < 1.2.0 doesn't
     # support it (illegal option -- ---), and the package list shipped
     # here (neofetch, plex-media-player, hermes-agent-desktop) has no
