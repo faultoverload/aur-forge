@@ -7,18 +7,34 @@
 # The 'run' mode is the long-running 24/7 service: starts darkhttpd in
 # the background and a scheduler that runs the full nightly sequence
 # (AUR diff scan, archcanary re-scan, drain-quarantine) at NIGHTLY_AT.
+#
+# systemd-as-PID-1 (24/7 mode only): arch-nspawn / systemd-nspawn inside
+# extra-x86_64-build require systemd to be running as PID 1 (systemd
+# refuses to start with "Can't run system mode unless PID 1"). So for
+# the 'run' subcommand we exec /sbin/init and let systemd start the
+# enabled aur-forge.service unit, which in turn runs run.sh. Other
+# subcommands (init / build / serve / update / drain) keep the original
+# direct-exec behavior — those are invoked manually via docker exec
+# for one-shot operations and don't need systemd-nspawn plumbing.
 set -euo pipefail
 
 CMD="${1:-help}"
 shift || true
 
 case "$CMD" in
+    run)
+        # Hand off to systemd. The enabled aur-forge.service unit runs
+        # /usr/local/bin/run.sh, which retains all the original
+        # behavior (init.sh bootstrap, darkhttpd, nightly scheduler,
+        # SIGTERM forwarding) — systemd just becomes the parent that
+        # restarts it on crash and captures its logs.
+        exec /sbin/init
+        ;;
     init)   exec /usr/local/bin/init.sh             "$@" ;;
     build)  exec /usr/local/bin/build.sh            "$@" ;;
     update) exec /usr/local/bin/update.sh           "$@" ;;
     serve)  exec /usr/local/bin/serve.sh            "$@" ;;
     drain)  exec /usr/local/bin/drain-quarantine.sh "$@" ;;
-    run)    exec /usr/local/bin/run.sh              "$@" ;;
     help|-h|--help)
         cat <<'EOF'
 aur-forge — AUR build farm container

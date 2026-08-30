@@ -108,6 +108,17 @@ RUN pacman-key --init \
  && pacman -Sy --noconfirm \
  && rm -rf /var/lib/pacman/sync/*
 
+# Generate a stable machine-id at build time so systemd-as-PID-1
+# doesn't re-roll one on every container start. We use systemd's own
+# machine-id-setup binary because it picks the same UUID format /
+# generation source as a real systemd boot would, keeping logs
+# consistent if anything ever reads machine-id off the image.
+# `systemd-machine-id-setup` requires systemd to be installed; we
+# install it as part of the pacman-key block below and run setup
+# here in the same layer.
+RUN SYSTEMD_UUID="$(cat /proc/sys/kernel/random/uuid)" \
+ && printf '%s' "${SYSTEMD_UUID}" > /etc/machine-id
+
 # Build a non-root user for makepkg (makepkg refuses to run as root by
 # default). The container's entrypoint runs as root and drops to this user
 # for the build itself; signed packages get copied out as root.
@@ -124,6 +135,39 @@ COPY update.sh     /usr/local/bin/update.sh
 COPY serve.sh      /usr/local/bin/serve.sh
 COPY run.sh        /usr/local/bin/run.sh
 COPY scripts/      /usr/local/lib/aur-forge/
+
+# systemd-as-PID-1 setup for the 24/7 'run' mode.
+# ------------------------------
+# arch-nspawn / systemd-nspawn (invoked by extra-x86_64-build on
+# every AUR build) require systemd to be running as PID 1 — systemd
+# itself refuses to start with "Can't run system mode unless PID 1".
+# We install systemd here, copy in our service unit, and enable it.
+# When the entrypoint's `run` subcommand fires it exec's /sbin/init
+# (which is /lib/systemd/systemd on Arch), systemd comes up as PID 1
+# with our unit enabled, and run.sh runs as a managed service.
+#
+# `systemd-sysvcompat` provides the /sbin/init symlink. The base
+# archlinux:latest image already includes /lib/systemd/systemd but
+# not the symlink, the unit files, or the journald defaults — the
+# -Syu below + systemctl enable wires all of that up.
+#
+# We disable systemd's default getty + multi-user.target defaults
+# (sshd, etc.) because aur-forge is a single-purpose container;
+# aur-forge.service is the only unit that should run.
+# We mask systemd's firstboot / remount-fs / machine-id-setup
+# services because they either try to write to /etc/machine-id (we
+# already did that at build time) or assume a writable rootfs that
+# the container doesn't provide. Failures here are non-fatal — the
+# `|| true` lets the build proceed even if a unit name changes in
+# a future systemd version.
+RUN pacman -S --noconfirm --needed systemd-sysvcompat dbus \
+ && systemctl mask \
+        systemd-firstboot.service \
+        systemd-remount-fs.service \
+ || true
+
+COPY aur-forge.service /etc/systemd/system/aur-forge.service
+RUN systemctl enable aur-forge.service
 
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh \
               /usr/local/bin/init.sh /usr/local/bin/update.sh \
