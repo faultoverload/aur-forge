@@ -13,14 +13,15 @@
 # Effect:
 #   1. Imports the repo's signing key (from /keys/aur-forge.pub on the server)
 #      into pacman's local keyring and marks it trusted.
-#   2. Writes a `[custom]` stanza to /etc/pacman.conf pointing at the server.
+#   2. Writes a `[${REPO_NAME}]` stanza to /etc/pacman.conf pointing at
+#      the server's /<REPO_NAME>.x86_64/ subdirectory.
 #   3. Runs `pacman -Sy` to prime the package database.
 #
 # Re-running is safe — it overwrites the existing stanza and re-imports the key.
 # Idempotent.
 #
 # Environment overrides:
-#   REPO_NAME          Repo name to register (default: custom)
+#   REPO_NAME          Repo name to register (default: aur-forge)
 #   PACMAN_CONF        Path to pacman.conf (default: /etc/pacman.conf)
 #   AUR_FORGE_SERVER   Default server if no arg given (default: https://aur-forge.gateslab.win)
 
@@ -163,7 +164,7 @@ awk -v repo="[${REPO_NAME}]" '
 
 # Append our fresh stanza at the end of the file. Server points at the
 # /<REPO_NAME>.x86_64/ subdirectory — that's where lighttpd serves the
-# pacman repo files (custom.db, custom.db.tar.zst, <pkg>-<ver>.pkg.tar.zst,
+# pacman repo files (aur-forge.db, aur-forge.db.tar.zst, <pkg>-<ver>.pkg.tar.zst,
 # etc.) from the container's /repo/ document root.
 REPO_URL="${SERVER}/${REPO_NAME}.x86_64"
 {
