@@ -7,7 +7,8 @@
 #   https://<server>/install-repo.sh
 #
 # Usage:
-#   curl -fsSL https://aur-forge.gateslab.win/install-repo.sh | sudo bash -s -- https://aur-forge.gateslab.win
+#   curl -fsSL https://aur-forge.gateslab.win/install-repo.sh \
+#     | sudo bash -s -- https://aur-forge.gateslab.win
 #
 # Effect:
 #   1. Imports the repo's signing key (from /keys/aur-forge.pub on the server)
@@ -23,7 +24,14 @@
 #   PACMAN_CONF        Path to pacman.conf (default: /etc/pacman.conf)
 #   AUR_FORGE_SERVER   Default server if no arg given (default: https://aur-forge.gateslab.win)
 
-set -euo pipefail
+# NOTE: set -u on, but NOT set -e. We do explicit error handling on each
+# step that can fail — pacman-key and gpg both return non-zero in corner
+# cases (missing key, broken pubring, etc.) that we want to recover from
+# rather than abort on. set -o pipefail is also off for the same reason:
+# the fingerprint-extraction pipeline legitimately hits empty input when
+# pacman-key can't find the uid-derived query, and we fall back to gpg
+# rather than crash the script.
+set -u
 
 # ---- Args / defaults --------------------------------------------------------
 
@@ -56,7 +64,8 @@ fi
 
 PUBKEY_URL="$SERVER/keys/aur-forge.pub"
 KEYRING_TMP="$(mktemp)"
-trap 'rm -f "$KEYRING_TMP"' EXIT
+TMP_CONF="$(mktemp)"
+trap 'rm -f "$KEYRING_TMP" "$TMP_CONF"' EXIT
 
 echo "[install-repo] fetching signing key from $PUBKEY_URL"
 if ! curl -fsS --connect-timeout 10 -m 60 \
@@ -75,39 +84,47 @@ if ! head -1 "$KEYRING_TMP" | grep -q -- '-----BEGIN PGP PUBLIC KEY BLOCK-----';
 fi
 
 echo "[install-repo] importing key into pacman keyring"
-pacman-key --add "$KEYRING_TMP"
-
-# Extract the primary fingerprint so we can lsig it. We grep for the 40-hex-char
-# line that follows "uid" (fingerprint line in --list-keys output).
-FPR="$(pacman-key --list-keys --keyring /etc/pacman.d/gnupg/pubring.gpg \
-            "$(awk '/^uid/{print; exit} 1' "$KEYRING_TMP" | sed -n 's/^.*<\(.*\)>.*$/\1/p')" \
-            2>/dev/null | awk '/^[0-9A-F]{40}$/{print; exit}')"
-
-# If we couldn't parse the uid-derived lookup (older pacman-key output shapes),
-# fall back to lsig'ing everything that was just added.
-if [[ -z "$FPR" ]]; then
-    # Re-import and lsig by file is not supported by pacman-key, but lsig-by-uid
-    # via the comment is. Use a heuristic: parse out the last 40-hex token from
-    # pacman-key -l output for any uid in the file.
-    FPR="$(gpg --homedir /etc/pacman.d/gnupg --with-colons \
-                --import-options show-only --import "$KEYRING_TMP" 2>/dev/null \
-            | awk -F: '$1=="fpr"{print $10; exit}')"
+if ! pacman-key --add "$KEYRING_TMP" 2>/dev/null; then
+    echo "[install-repo] pacman-key --add failed (exit $?)" >&2
+    exit 3
 fi
 
-if [[ -n "$FPR" ]]; then
-    echo "[install-repo] locally signing key $FPR"
-    pacman-key --lsign-key "$FPR"
+# ---- Extract the fingerprint from the imported key ------------------------
+#
+# Try gpg --import-options show-only first — that reads the key file and
+# prints its records without modifying any keyring. The fingerprint record
+# has type 'fpr' and the SHA is in field 10. This works regardless of which
+# keyring pacman-key uses internally.
+
+echo "[install-repo] extracting key fingerprint"
+FPR=""
+FPR="$(gpg --with-colons --import-options show-only --import "$KEYRING_TMP" 2>/dev/null \
+        | awk -F: '$1=="fpr" {print $10; exit}')"
+
+# Sanity check: must be 40 hex chars (or 32 for v5 keys but aur-forge uses ed25519)
+if [[ ! "$FPR" =~ ^[0-9A-F]{40}$ ]]; then
+    FPR=""
+fi
+
+if [[ -z "$FPR" ]]; then
+    echo "[install-repo] WARNING: could not extract fingerprint from key." >&2
+    echo "[install-repo]   key IS imported into pacman's keyring." >&2
+    echo "[install-repo]   you may need to run manually:" >&2
+    echo "[install-repo]     sudo pacman-key --lsign-key <FPR>" >&2
 else
-    echo "[install-repo] warning: could not extract fingerprint; key imported but not lsigned." >&2
-    echo "[install-repo]   you may need to run: sudo pacman-key --lsign-key <FPR>" >&2
+    echo "[install-repo] locally signing key $FPR"
+    # Use printf answers to the trust prompt so the call is non-interactive.
+    # pacman-key --lsign-key asks: "Really sign? [y/N]" — answer "y\n".
+    if ! printf 'y\n' | pacman-key --lsign-key "$FPR" >/dev/null 2>&1; then
+        echo "[install-repo] WARNING: pacman-key --lsign-key failed." >&2
+        echo "[install-repo]   the key is imported but not locally trusted." >&2
+        echo "[install-repo]   you may need to run: sudo pacman-key --lsign-key $FPR" >&2
+    fi
 fi
 
 # ---- Write the pacman.conf stanza ------------------------------------------
 
 # Remove any existing [REPO_NAME] stanza (idempotent re-run).
-TMP_CONF="$(mktemp)"
-trap 'rm -f "$KEYRING_TMP" "$TMP_CONF"' EXIT
-
 awk -v repo="\\[${REPO_NAME}\\]" '
     BEGIN { in_repo = 0 }
     # Start of the named repo: drop everything from this line until the next
