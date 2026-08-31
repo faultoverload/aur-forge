@@ -32,10 +32,21 @@ RestartSec=5
 # CAP_SYS_ADMIN for chroot mount plumbing, so the service must run
 # as root rather than as a dedicated user.
 User=root
-# Surface run.sh's stdout/stderr (which goes through bash trap
-# output) to journald / docker logs via the conmon-style pipe.
-StandardOutput=journal+console
-StandardError=journal+console
+# Surface run.sh's stdout/stderr to PID 1's stdout so `docker logs`
+# captures it. The journal+console setting that lived here before
+# worked on real systemd (journald indexes the log AND the console
+# sink forwards to PID 1's TTY), but breaks inside Docker containers:
+# the console sink tries to write to a TTY that isn't attached to
+# PID 1's stdout, and journald's ring buffer is never flushed to
+# PID 1's pipe — so `docker logs` returns 0 bytes for the lifetime
+# of the container, even though journalctl -u aur-forge from inside
+# the container sees the full stream. Drop `journal+` and keep only
+# `console`: that's the FD Docker's conmon is reading. The trade-off
+# is no journald indexing inside the container, but since /var/log/journal
+# isn't persistent across container restarts anyway, that wasn't
+# really buying anything.
+StandardOutput=console
+StandardError=console
 
 [Install]
 WantedBy=multi-user.target
