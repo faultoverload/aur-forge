@@ -1,24 +1,30 @@
 [Unit]
 Description=aur-forge — AUR build farm (24/7 mode)
 Documentation=https://github.com/faultoverload/aur-forge
-# Wait for the network so AUR RPC calls in update.sh work, and for
-# the journal so log output is captured before our service starts.
-After=network-online.target systemd-journald.service
-Wants=network-online.target
+# Wait for the journal so log output is captured before our service starts.
+#
+# NOTE: deliberately NOT ordering against network-online.target. In Docker
+# containers, systemd-networkd-wait-online.service fails (Docker doesn't
+# satisfy the "online" condition for systemd's network checks — networkctl
+# shows "State: routable" with "Online state: unknown", which wait-online
+# treats as failure). That failure was blocking aur-forge.service from ever
+# auto-starting in fresh containers, leaving lighttpd dead and Traefik
+# returning 404 to every request. The AUR RPC + signing operations inside
+# run.sh / build.sh handle their own transient-network-retry logic, so
+# ordering against network-online.target buys us nothing.
+After=systemd-journald.service
 
 [Service]
 Type=simple
-# run.sh calls init.sh (idempotent), starts darkhttpd in the
+# run.sh calls init.sh (idempotent), starts lighttpd in the
 # background, then starts the nightly scheduler. It traps SIGTERM
 # and forwards to both children. systemd manages the whole process
-# group as a single Type=simple unit — darkhttpd + scheduler are
+# group as a single Type=simple unit — lighttpd + scheduler are
 # direct children of the bash process, not separate units. This
 # preserves the original 24/7 single-PID-group design.
 ExecStart=/usr/local/bin/run.sh
 # SIGTERM forward: run.sh's trap exits 0 within ~60s. After that
 # systemd treats it as a clean stop and restarts per policy.
-# Restart=always so a transient darkhttpd crash (e.g. port already
-# bound after a fast redeploy) doesn't take the container down.
 Restart=always
 RestartSec=5
 # run.sh drops privileges internally via sudo -u builder for
