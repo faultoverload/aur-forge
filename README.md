@@ -385,8 +385,8 @@ The UI shows the same content as `/install.html`:
 
 ```bash
 # 1. Trust the signing key (fingerprint is on the main page)
-sudo pacman-key --recv-keys <FPR>
-sudo pacman-key --lsign-key <FPR>
+sudo pacman-key --recv-keys 12E19CE0B88FF328D70C2E2AC84E07290A876FCF
+sudo pacman-key --lsign-key 12E19CE0B88FF328D70C2E2AC84E07290A876FCF
 
 # Or fetch it directly:
 curl -fsSL https://aur-forge.gateslab.win/keys/aur-forge.pub \

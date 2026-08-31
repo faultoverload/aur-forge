@@ -136,6 +136,7 @@ COPY scripts/      /usr/local/lib/aur-forge/
 COPY cgi-bin/      /usr/lib/aur-forge/cgi-bin/
 COPY www/          /usr/share/aur-forge/www/
 COPY lighttpd.conf /etc/aur-forge/lighttpd.conf
+COPY install-repo.sh /usr/share/aur-forge/www/install-repo.sh
 
 # Generate the CSRF secret at build time. Every container built from this
 # image gets its OWN secret baked in — not shared across images, not
