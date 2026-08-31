@@ -29,8 +29,9 @@ PORT="${PORT:-8080}"
 }
 
 # Sanity: CSRF secret should exist (Dockerfile RUN at build time).
-[[ -s /etc/aur-forge/csrf-secret ]] || {
-    echo "[serve] /etc/aur-forge/csrf-secret missing — image is broken" >&2
+[[ -s /keys/csrf-secret ]] || {
+    echo "[serve] /keys/csrf-secret missing — init.sh should have created it" >&2
+    echo "[serve] (the secret persists across redeploys via the /keys bind-mount)" >&2
     exit 1
 }
 
