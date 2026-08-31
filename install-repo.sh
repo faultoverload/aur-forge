@@ -125,34 +125,46 @@ fi
 # ---- Write the pacman.conf stanza ------------------------------------------
 
 # Remove any existing [REPO_NAME] stanza (idempotent re-run).
-awk -v repo="\\[${REPO_NAME}\\]" '
+# Use index() instead of regex matching so we don't have to escape the
+# [ and ] characters (which would otherwise trip awk's "escape sequence"
+# warning when this script is embedded in a heredoc).
+awk -v repo="[${REPO_NAME}]" '
     BEGIN { in_repo = 0 }
     # Start of the named repo: drop everything from this line until the next
     # blank line or the start of the next section header.
-    $0 ~ "^"repo"[[:space:]]*$" {
-        in_repo = 1
-        next
-    }
-    in_repo == 1 {
-        # Stop skipping at the next section header [foo] or end of file.
-        if ($0 ~ /^\[[^]]+\][[:space:]]*$/) {
-            in_repo = 0
-        } else if ($0 ~ /^[[:space:]]*$/) {
-            in_repo = 0
-            # preserve the blank line
-        } else {
+    {
+        stripped = $0
+        sub(/[[:space:]]*$/, "", stripped)
+        if (in_repo == 0 && stripped == repo) {
+            in_repo = 1
             next
         }
+        if (in_repo == 1) {
+            # Stop skipping at the next section header [foo] or end of file.
+            if (stripped == "") {
+                in_repo = 0
+                # preserve the blank line
+            } else if (substr(stripped, 1, 1) == "[" \
+                    && index(stripped, "]") > 0) {
+                in_repo = 0
+            } else {
+                next
+            }
+        }
+        print
     }
-    { print }
 ' "$PACMAN_CONF" > "$TMP_CONF"
 
-# Append our fresh stanza at the end of the file.
+# Append our fresh stanza at the end of the file. Server points at the
+# /<REPO_NAME>.x86_64/ subdirectory — that's where lighttpd serves the
+# pacman repo files (custom.db, custom.db.tar.zst, <pkg>-<ver>.pkg.tar.zst,
+# etc.) from the container's /repo/ document root.
+REPO_URL="${SERVER}/${REPO_NAME}.x86_64"
 {
     echo ""
     echo "[${REPO_NAME}]"
     echo "SigLevel = Required TrustAll"
-    echo "Server = ${SERVER}"
+    echo "Server = ${REPO_URL}"
 } >> "$TMP_CONF"
 
 # Atomic replace.
