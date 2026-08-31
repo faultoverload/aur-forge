@@ -38,7 +38,13 @@ set -u
 SERVER="${1:-${AUR_FORGE_SERVER:-https://aur-forge.gateslab.win}}"
 SERVER="${SERVER%/}"   # strip trailing slash
 
-REPO_NAME="${REPO_NAME:-custom}"
+# Default repo name on both server and client. The container's compose
+# file sets REPO_NAME=aur-forge, init.sh uses this to set up
+# /repo/aur-forge.x86_64/, repo-add writes aur-forge.db, and this
+# install script writes [aur-forge] into the client's /etc/pacman.conf.
+# Override with REPO_NAME=foo env var or as arg if you're running
+# multiple aur-forge instances on the same host.
+REPO_NAME="${REPO_NAME:-aur-forge}"
 PACMAN_CONF="${PACMAN_CONF:-/etc/pacman.conf}"
 
 # ---- Sanity -----------------------------------------------------------------
@@ -175,8 +181,13 @@ echo "[install-repo] wrote [${REPO_NAME}] stanza to $PACMAN_CONF"
 
 # ---- Refresh package database -----------------------------------------------
 
-echo "[install-repo] running 'pacman -Sy ${REPO_NAME}'"
-if ! pacman -Sy "${REPO_NAME}"; then
+echo "[install-repo] running 'pacman -Sy' (refresh all enabled repos)"
+# Note: `pacman -Sy <repo-name>` is NOT valid — pacman interprets the
+# argument as a target package to install. To refresh a single repo,
+# you'd need to disable all others with --refresh first, which is too
+# invasive for a one-line curl|bash bootstrap. `pacman -Sy` (no arg)
+# syncs every enabled repo, which is what the user actually wants.
+if ! pacman -Sy; then
     echo "[install-repo] pacman -Sy failed — verify network, key, and Server URL" >&2
     exit 4
 fi

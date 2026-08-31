@@ -23,7 +23,7 @@
 set -euo pipefail
 
 # Defaults — all overridable from the caller's environment.
-REPO_NAME="${REPO_NAME:-custom}"
+REPO_NAME="${REPO_NAME:-aur-forge}"
 PKGLIST="${PKGLIST:-/pkglist}"
 REPO_DIR_DEFAULT="/repo/${REPO_NAME}.x86_64"
 AUR_BASE="${AUR_BASE:-https://aur.archlinux.org/rpc/?v=5&type=multiinfo}"

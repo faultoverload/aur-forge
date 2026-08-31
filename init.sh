@@ -4,7 +4,7 @@
 # on an existing keyring is a no-op.
 set -euo pipefail
 
-REPO_NAME="${REPO_NAME:-custom}"
+REPO_NAME="${REPO_NAME:-aur-forge}"
 REPO_OWNER="${REPO_OWNER:-faultoverload}"
 REPO_EMAIL="${REPO_EMAIL:-woodsyx@gmail.com}"
 GPG_KEY_NAME="${GPG_KEY_NAME:-aur-forge}"
@@ -58,16 +58,93 @@ chmod 0644 /keys/aur-forge.pub
 # file already exists.
 [[ -f /etc/machine-id ]] || systemd-machine-id-setup
 
-# Expose the pubkey through darkhttpd's served root (/repo). darkhttpd
-# is rooted at /repo and cannot serve /keys directly because /keys is a
-# separate bind mount; symlinking the pubkey into the repo tree lets
-# clients fetch https://aur-forge.gateslab.win/keys/aur-forge.pub for
+# Expose the pubkey through the served root (/repo). lighttpd is rooted
+# at /repo and cannot serve /keys directly because /keys is a separate
+# bind mount; symlinking the pubkey into the repo tree lets clients
+# fetch https://aur-forge.gateslab.win/keys/aur-forge.pub for
 # `pacman-key --add` and pacman-key --lsign. The /repo mount is RW in
 # the compose spec so this symlink survives across runs. We point at
 # /keys/aur-forge.pub (the source of truth) rather than copy, so key
 # rotations are reflected immediately on the next init.
 mkdir -p "/repo/keys"
 ln -sf /keys/aur-forge.pub "/repo/keys/aur-forge.pub"
+
+# ---------------------------------------------------------------------
+# One-shot migration: rename the repo dir if a previous install used
+# the old default name "custom". aur-forge renamed REPO_NAME from
+# "custom" to "aur-forge" in 2026-08-31; existing containers had a
+# populated /repo/custom.x86_64/ that we want to carry forward rather
+# than re-build every package from scratch. Strategy:
+#   1. If /repo/${REPO_NAME}.x86_64/ is empty AND /repo/custom.x86_64/
+#      has packages, move everything across and re-create the db under
+#      the new name.
+#   2. Once migrated, the old /repo/custom.x86_64/ is removed so a
+#      later init can identify this as already-done.
+# ---------------------------------------------------------------------
+REPO_DIR="/repo/${REPO_NAME}.x86_64"
+LEGACY_DIR="/repo/custom.x86_64"
+LEGACY_MARKER="/repo/.renamed-from-custom"
+
+if [[ "$REPO_NAME" != "custom" && ! -f "$LEGACY_MARKER" \
+        && -d "$LEGACY_DIR" ]]; then
+    # Legacy dir exists; check whether it has any entries (without
+    # relying on shellcheck's `-d .../*` idiom or parsing ls output).
+    legacy_has_files=0
+    shopt -s nullglob dotglob
+    for _entry in "$LEGACY_DIR"/*; do
+        [[ -e "$_entry" ]] && legacy_has_files=1 && break
+    done
+    shopt -u nullglob dotglob
+
+    # Detect "needs migration": legacy has files AND target dir is
+    # either missing or empty.
+    target_empty=1
+    if [[ -d "$REPO_DIR" ]]; then
+        target_empty=0
+        shopt -s nullglob dotglob
+        for _t in "$REPO_DIR"/*; do
+            [[ -e "$_t" ]] && target_empty=0 && break || target_empty=1
+        done
+        shopt -u nullglob dotglob
+    fi
+
+    if (( legacy_has_files )) && (( target_empty )); then
+        echo "[init] migrating legacy repo dir $LEGACY_DIR -> $REPO_DIR"
+        mkdir -p "$REPO_DIR"
+        # Move .pkg.tar.zst + .sig files; leave .db / .files behind to
+        # regenerate under the new name.
+        shopt -s nullglob
+        for f in "$LEGACY_DIR"/*.pkg.tar.zst "$LEGACY_DIR"/*.pkg.tar.zst.sig; do
+            mv -f "$f" "$REPO_DIR/"
+        done
+        shopt -u nullglob
+
+        # Regenerate the db and files under the new name so the .db
+        # references match REPO_NAME. Need FPR for repo-add --sign.
+        FPR="$(gpg --with-colons --import-options show-only \
+                    --import /keys/aur-forge.pub 2>/dev/null \
+                | awk -F: '$1=="fpr" {print $10; exit}')"
+        if [[ -n "$FPR" ]]; then
+            cd "$REPO_DIR"
+            # Remove any stale db/files first so repo-add doesn't see
+            # duplicate entries.
+            rm -f aur-forge.db* aur-forge.files*
+            for pkg in *.pkg.tar.zst; do
+                [[ -f "$pkg" ]] || continue
+                repo-add --sign --key "$FPR" \
+                    aur-forge.db.tar.zst "$pkg"
+            done
+            echo "[init] regenerated aur-forge.db with $(ls aur-forge.db* 2>/dev/null | wc -l) entries"
+        else
+            echo "[init] WARNING: could not extract FPR; db not regenerated" >&2
+        fi
+
+        # Remove the old (empty after migration) legacy dir
+        rm -rf "$LEGACY_DIR"
+        echo "[init] removed legacy $LEGACY_DIR"
+    fi
+    touch "$LEGACY_MARKER"
+fi
 
 # Seed the repo directory. Do NOT touch .db / .files placeholders —
 # repo-add creates them on the first real build, and a 0-byte .db

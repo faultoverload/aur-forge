@@ -17,7 +17,7 @@ aur-forge: clone, **scan**, **diff**, chroot-build, sign, repo-add, serve. Done.
 
 ```
 +----------------+        +-----------------------+        +----------------+
-| aur-forge      |  --->  | /repo/custom.x86_64/  |  --->  | lighttpd :8080 |
+| aur-forge      |  --->  | /repo/aur-forge.x86_64/  |  --->  | lighttpd :8080 |
 |   build (x N)  |        |   *.pkg.tar.zst       |        | + bash CGI     |
 |                |        |   *.db.tar.zst        |        +----------------+
 | archcanary +   |        |   *.sig                     |
@@ -218,7 +218,7 @@ curl -fsSL https://aur-forge.gateslab.win/keys/aur-forge.pub -o /tmp/aur-forge.p
 sudo ./install-repo.sh https://aur-forge.gateslab.win
 ```
 
-That imports the key, writes a `[custom]` stanza to `/etc/pacman.conf`, and runs `pacman -Sy`. From then on: `pacman -Syu` works as if `custom` were just another official repo.
+That imports the key, writes a `[aur-forge]` stanza to `/etc/pacman.conf`, and runs `pacman -Sy`. From then on: `pacman -Syu` works as if `aur-forge` were just another official repo.
 
 ## Layout
 
@@ -250,7 +250,7 @@ Bind-mounted from the host (`/opt/docker/data/aur-forge/`):
 
 ```
 /opt/docker/data/aur-forge/
-├── repo/                       served output (custom.x86_64/*)
+├── repo/                       served output (aur-forge.x86_64/*)
 ├── cache/                      chroot roots + ccache
 ├── keys/                       GPG keyring (survives container rebuilds)
 ├── approvals/                  PKGBUILD approval JSON store (one file per package)
@@ -341,7 +341,7 @@ When the gate quarantines a malicious update:
 | `STRICT_FIRST_BUILD`    | `0`                      | When `1`, first build of any package requires human review instead of auto-approval. |
 | `APPROVALS_DIR`         | `/approvals`             | On-disk location of the PKGBUILD approval JSON store.         |
 | `AUR_FORGE_BUILD_SH`    | `/usr/local/bin/build.sh`| Override path to `build.sh` for `drain-quarantine.sh` in dev. |
-| `REPO_NAME`             | `custom`                 | Pacman repo name (matches compose / Traefik labels).          |
+| `REPO_NAME`             | `aur-forge`                 | Pacman repo name (matches compose / Traefik labels).          |
 | `REPO_OWNER`            | `faultoverload`          | Owner/contact for the repo metadata.                          |
 | `REPO_EMAIL`            | `woodsyx@gmail.com`      | Email matching the GPG signing key.                           |
 | `GPG_PASSPHRASE`        | (unset)                  | Passphrase for unattended GPG signing.                        |
@@ -360,7 +360,7 @@ When the gate quarantines a malicious update:
 | `/install.html`              | GET    | Standalone printable install instructions. Doesn't require a CSRF round-trip.                                                                  |
 | `/style.css`                 | GET    | Dark retro stylesheet (also inlined into every CGI page via `cgi_html_doc`).                                                                   |
 | `/keys/aur-forge.pub`        | GET    | The repo's public signing key. Symlinked from `/keys/aur-forge.pub` into `/repo/keys/` by `init.sh` so lighttpd serves it via the repo doc-root. |
-| `/custom.x86_64/...`         | GET    | The signed pacman repo, served as static files.                                                                                                |
+| `/aur-forge.x86_64/...`         | GET    | The signed pacman repo, served as static files.                                                                                                |
 
 ### Why lighttpd (and not darkhttpd)
 
@@ -385,8 +385,8 @@ The UI shows the same content as `/install.html`:
 
 ```bash
 # 1. Trust the signing key (fingerprint is on the main page)
-sudo pacman-key --recv-keys 12E19CE0B88FF328D70C2E2AC84E07290A876FCF
-sudo pacman-key --lsign-key 12E19CE0B88FF328D70C2E2AC84E07290A876FCF
+sudo pacman-key --recv-keys <FPR>
+sudo pacman-key --lsign-key <FPR>
 
 # Or fetch it directly:
 curl -fsSL https://aur-forge.gateslab.win/keys/aur-forge.pub \

@@ -13,7 +13,7 @@
 # HTTP to this port.
 set -euo pipefail
 
-REPO_NAME="${REPO_NAME:-custom}"
+REPO_NAME="${REPO_NAME:-aur-forge}"
 PORT="${PORT:-8080}"
 
 # Sanity: the repo dir should exist (init must have run first).

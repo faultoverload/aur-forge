@@ -12,7 +12,7 @@
 # file focused on the update workflow.
 set -euo pipefail
 
-REPO_NAME="${REPO_NAME:-custom}"
+REPO_NAME="${REPO_NAME:-aur-forge}"
 REPO_OWNER="${REPO_OWNER:-faultoverload}"
 REPO_EMAIL="${REPO_EMAIL:-woodsyx@gmail.com}"
 GPG_PASSPHRASE="${GPG_PASSPHRASE:-}"
