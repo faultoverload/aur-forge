@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>aur-forge — install instructions</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<h1>aur-forge — install instructions</h1>
+
+<p>Add this AUR package repo to an Arch Linux client. The repo name is <code>custom</code> by default (override with the <code>REPO_NAME</code> env var in the container).</p>
+
+<h2>1. Import the signing key</h2>
+<p>The GPG fingerprint is shown on the repo's main page. Two equivalent options:</p>
+
+<pre><code># Option A — fetch from a keyserver using the fingerprint
+sudo pacman-key --recv-keys &lt;FPR&gt;
+sudo pacman-key --lsign-key &lt;FPR&gt;
+
+# Option B — fetch directly from the repo (works without keyserver access)
+curl -fsSL https://aur-forge.gateslab.win/keys/aur-forge.pub \
+    | sudo pacman-key --add -
+sudo pacman-key --lsign-key "$(curl -fsSL https://aur-forge.gateslab.win/keys/aur-forge.pub | gpg --with-colons --import-options show-only --import | awk -F: '/^fpr:/ {print $10; exit}')"</code></pre>
+
+<h2>2. Register the repo</h2>
+
+<pre><code>curl -fsSL https://aur-forge.gateslab.win/install-repo.sh | sudo bash</code></pre>
+
+<p>This drops a pacman config snippet at <code>/etc/pacman.d/aur-forge</code> and adds the server to <code>pacman.conf</code>. Read the script before piping to bash if you prefer to inspect:</p>
+
+<pre><code>curl -fsSL https://aur-forge.gateslab.win/install-repo.sh
+# review, then:
+sudo bash install-repo.sh</code></pre>
+
+<h2>3. Install</h2>
+
+<pre><code>sudo pacman -Syu
+pacman -Ss aur-forge   # list available packages
+sudo pacman -S &lt;package-name&gt;</code></pre>
+
+<h2>Browse the repo</h2>
+<ul>
+<li><a href="/custom.x86_64/">Repo index</a> (<code>/custom.x86_64/</code>)</li>
+<li><a href="/keys/aur-forge.pub">Public signing key</a></li>
+<li><a href="/">Status page</a> — list packages + trigger builds + add new ones</li>
+</ul>
+
+<footer>
+aur-forge web UI &mdash; powered by <code>lighttpd + bash CGI</code>.
+</footer>
+</body>
+</html>

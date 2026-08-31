@@ -17,10 +17,10 @@ aur-forge: clone, **scan**, **diff**, chroot-build, sign, repo-add, serve. Done.
 
 ```
 +----------------+        +-----------------------+        +----------------+
-| aur-forge      |  --->  | /repo/custom.x86_64/  |  --->  | darkhttpd :8080|
-|   build (x N)  |        |   *.pkg.tar.zst       |        +----------------+
-|                |        |   *.db.tar.zst        |              |
-| archcanary +   |        |   *.sig               |              v
+| aur-forge      |  --->  | /repo/custom.x86_64/  |  --->  | lighttpd :8080 |
+|   build (x N)  |        |   *.pkg.tar.zst       |        | + bash CGI     |
+|                |        |   *.db.tar.zst        |        +----------------+
+| archcanary +   |        |   *.sig                     |
 | srcinfo diff   |        +-----------------------+      Traefik :443
 | extra-x86_64-  |                                       aur-forge.gateslab.win
 |   build        |                                              |
@@ -40,7 +40,7 @@ aur-forge: clone, **scan**, **diff**, chroot-build, sign, repo-add, serve. Done.
 - **Builds:** `extra-x86_64-build` from `devtools` — clean chroot per package.
 - **Scanner:** `archcanary` from `musqz/archcanary` — blocklist check before every build.
 - **Diff:** `.SRCINFO` comparison vs stored approval — auto-update for version bumps, quarantine for dep/code/install changes.
-- **Server:** `darkhttpd` (single static-file binary, ~40KB, rock solid).
+- **Server:** `lighttpd` (replaces `darkhttpd`, which has no CGI support) — serves the signed pacman repo as static files and the web UI via `mod_cgi` + bash scripts.
 - **Reverse proxy:** Traefik on bigballs, `internal-only@file` middleware.
 - **Trust:** GPG-signed repo, pubkey shipped via HTTPS.
 
@@ -345,6 +345,77 @@ When the gate quarantines a malicious update:
 | `REPO_OWNER`            | `faultoverload`          | Owner/contact for the repo metadata.                          |
 | `REPO_EMAIL`            | `woodsyx@gmail.com`      | Email matching the GPG signing key.                           |
 | `GPG_PASSPHRASE`        | (unset)                  | Passphrase for unattended GPG signing.                        |
+| `PORT`                  | `8080`                   | TCP port lighttpd listens on (internal; Traefik fronts 443).  |
+| `CSRF_SECRET_FILE`      | `/etc/aur-forge/csrf-secret` | Path to the CSRF secret. Auto-created at build time with mode 0600. Do NOT commit. |
+
+## Web UI
+
+`https://aur-forge.gateslab.win/` serves a small status page that shows every package in `pkglist.txt` with its current state. The same `lighttpd` instance that serves the signed pacman repo also handles three CGI endpoints:
+
+| URL                          | Method | Behavior                                                                                                                                       |
+| ---------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/`                          | GET    | Renders the package table: built / building / quarantined / missing, with local version, AUR version, and OutOfDate flag. Embeds the install instructions and the two forms below. Rewritten to `/cgi-bin/index.cgi` via `mod_rewrite`. |
+| `/cgi-bin/check.cgi`         | POST   | Background-spawns `/usr/local/bin/update.sh`. Rebuilds only the packages whose upstream AUR version differs from the local one. Returns immediately with a "queued" message — the build runs asynchronously and logs to `/var/log/aur-forge-check.log`. No-op if everything is already current. |
+| `/cgi-bin/add.cgi`           | POST   | Validates the `packages` textarea (one name per line) against the Arch package-name regex, dedupes against the current `pkglist.txt`, and atomically appends new entries. Returns a summary page listing added / already-present / rejected / ignored names. |
+| `/install.html`              | GET    | Standalone printable install instructions. Doesn't require a CSRF round-trip.                                                                  |
+| `/style.css`                 | GET    | Dark retro stylesheet (also inlined into every CGI page via `cgi_html_doc`).                                                                   |
+| `/keys/aur-forge.pub`        | GET    | The repo's public signing key. Symlinked from `/keys/aur-forge.pub` into `/repo/keys/` by `init.sh` so lighttpd serves it via the repo doc-root. |
+| `/custom.x86_64/...`         | GET    | The signed pacman repo, served as static files.                                                                                                |
+
+### Why lighttpd (and not darkhttpd)
+
+`darkhttpd` was the original server. It's tiny (~40 KB) and bulletproof, but its README states: "Only serves static content — no CGI." Verified against the upstream source on 2026-08-30. So `darkhttpd /repo --cgi /cgi-bin` would silently start a static-only server and 404 every `/cgi-bin/*` request.
+
+`lighttpd` 1.4.85-1 (Arch `extra`, ~1.25 MiB installed) gives us `mod_cgi` + `mod_rewrite` in one package, zero new AUR deps, and zero open CVEs on the Arch security tracker as of 2026-08-30. The full server-pick rationale + empirical test results live at `Research/2026-08-30-aur-forge-web-server.md` in the vault.
+
+### Security posture
+
+The web UI is **public, no auth**. Server-side mitigation only:
+
+1. **Regex validation.** Every package name in the `add` form is checked against `^[a-z0-9][a-z0-9._+-]{0,63}$` (the same regex pacman uses). Names containing `/`, `..`, whitespace, control chars, or longer than 64 chars are silently dropped.
+2. **Dedup against `pkglist.txt`.** Duplicate names are rejected, not appended twice.
+3. **Atomic write.** `add.cgi` writes the new pkglist to a temp file in the same directory and `mv -f`s it into place. Concurrent writes don't corrupt the file.
+4. **CSRF token.** Every form carries a `<input type="hidden" name="csrf" value="nonce:hash">` where `hash = sha256(secret:nonce)` and `secret` is a 32-byte hex string generated at image build time and stored at `/etc/aur-forge/csrf-secret` (mode 0600, root-owned). The CGI recomputes the hash and compares. A drive-by bot without the secret cannot mint a matching token. **Not bulletproof against a determined attacker on the same network** — replace with real auth (Traefik basicAuth middleware, or Pocket-ID OIDC) if you ever expose this beyond a homelab.
+5. **POST size cap.** `lighttpd.conf` sets `server.max-request-size = 1024` (1 KiB). The CSRF + a few package names fits; an attacker can't ship a 100 MB form body.
+6. **Background spawn.** `check.cgi` background-spawns `update.sh` via `setsid nohup` so the CGI returns immediately and the build can't tie up the web worker.
+
+### How to add the repo to a client
+
+The UI shows the same content as `/install.html`:
+
+```bash
+# 1. Trust the signing key (fingerprint is on the main page)
+sudo pacman-key --recv-keys <FPR>
+sudo pacman-key --lsign-key <FPR>
+
+# Or fetch it directly:
+curl -fsSL https://aur-forge.gateslab.win/keys/aur-forge.pub \
+    | sudo pacman-key --add -
+
+# 2. Register the repo (drops /etc/pacman.d/aur-forge.conf)
+curl -fsSL https://aur-forge.gateslab.win/install-repo.sh | sudo bash
+
+# 3. Install
+sudo pacman -Syu
+pacman -Ss aur-forge
+sudo pacman -S <package-name>
+```
+
+### Server reload
+
+- `kill -HUP $(cat /var/run/aur-forge/lighttpd.pid)` — graceful reload after `lighttpd.conf` edits, in-flight requests finish.
+- `systemctl restart aur-forge` — blunt option, drops in-flight requests.
+
+### Local development
+
+To run the tests:
+
+```bash
+bash tests/run-tests.sh        # existing: approval-store, srcinfo-diff, quarantine scripts
+bash tests/run-webui-tests.sh  # new: lib-aur.sh, CGI scripts, live lighttpd smoke test
+```
+
+The web UI test suite skips the live lighttpd smoke test if `lighttpd` is not installed; the CGI unit cases still run.
 
 ## Limitations
 

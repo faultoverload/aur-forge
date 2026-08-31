@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
-# aur-forge serve — run darkhttpd against /repo. Long-running.
+# aur-forge serve — run lighttpd against /repo. Long-running.
+#
+# Replaces darkhttpd (which has no CGI support, verified against the
+# upstream source). lighttpd serves:
+#   - the pacman repo at /<REPO_NAME>.x86_64/ (static files)
+#   - the public signing key at /keys/aur-forge.pub (static, symlinked
+#     into /repo/keys at init.sh time)
+#   - the web UI at / (GET -> /cgi-bin/index.cgi via mod_rewrite)
+#   - the form handlers at /cgi-bin/check.cgi and /cgi-bin/add.cgi
+#
+# Traefik in front of the container terminates TLS and forwards plain
+# HTTP to this port.
 set -euo pipefail
 
 REPO_NAME="${REPO_NAME:-custom}"
@@ -11,18 +22,29 @@ PORT="${PORT:-8080}"
     exit 1
 }
 
-# darkhttpd: -1 single-threaded is fine for a tiny repo, but we want
-# concurrent GETs so pacman can fetch multiple packages in parallel.
-# --no-listing hides the directory index for anything we don't explicitly
-# link.
-echo "[serve] darkhttpd on 0.0.0.0:${PORT} -> /repo"
-# --log /dev/stdout worked when the entrypoint was PID 1 (the docker
-# PTY makes /dev/stdout a real file). Under systemd-as-PID-1 there's
-# no PTY and /dev/stdout is missing, so darkhttpd dies with:
-#   "opening logfile: fopen(/dev/stdout): No such device or address"
-# Drop the flag entirely — darkhttpd defaults to stderr, which
-# systemd captures into the journal and `docker logs` shows.
-exec darkhttpd /repo \
-    --port "${PORT}" \
-    --addr 0.0.0.0 \
-    --no-listing
+# Sanity: the CGI script dir should exist (Dockerfile COPY).
+[[ -d /usr/lib/aur-forge/cgi-bin ]] || {
+    echo "[serve] /usr/lib/aur-forge/cgi-bin missing — image is broken" >&2
+    exit 1
+}
+
+# Sanity: CSRF secret should exist (Dockerfile RUN at build time).
+[[ -s /etc/aur-forge/csrf-secret ]] || {
+    echo "[serve] /etc/aur-forge/csrf-secret missing — image is broken" >&2
+    exit 1
+}
+
+# lighttpd needs a writable upload-dir for its temp files (used by
+# mod_dirlisting, mod_cgi, mod_alias). The run-as-user (uid 999) needs
+# to be able to create files here.
+mkdir -p /var/cache/aur-forge-lighttpd /var/run/aur-forge /var/log/aur-forge-lighttpd
+chown -R 999:1000 /var/cache/aur-forge-lighttpd /var/run/aur-forge /var/log/aur-forge-lighttpd 2>/dev/null || true
+
+echo "[serve] lighttpd on 0.0.0.0:${PORT} -> /repo (cgi-bin: /usr/lib/aur-forge/cgi-bin)"
+# lighttpd in -D (don't daemonize) mode is the systemd-friendly form.
+# The unit's `kill -HUP $(pidof lighttpd)` triggers a graceful reload
+# after lighttpd.conf edits; `systemctl restart aur-forge` is the
+# blunt option.
+exec /usr/bin/lighttpd \
+    -D \
+    -f /etc/aur-forge/lighttpd.conf
