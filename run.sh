@@ -2,8 +2,10 @@
 # aur-forge run — 24/7 single-container mode.
 #
 # Starts three things in parallel under a single bash process group:
-#   1. darkhttpd foreground, serving /repo on $PORT (default 8080).
+#   1. lighttpd foreground, serving /repo on $PORT (default 8080).
 #      Traefik front of that publishes https://aur-forge.gateslab.win.
+#      lighttpd also handles the bash CGI at /cgi-bin/{index,check,add}.cgi
+#      for the web UI. Replaces darkhttpd (which has no CGI support).
 #   2. A nightly scheduler background loop that, at NIGHTLY_AT (default
 #      "03:00", interpreted in TZ which the container must be set to),
 #      runs the full nightly sequence:
@@ -18,7 +20,7 @@
 #           cloned tree, never builds).
 #   3. This very bash, holding the trap that forwards SIGTERM to both.
 #
-# On SIGTERM, darkhttpd gets SIGTERM (it shuts down cleanly in <1s) and
+# On SIGTERM, lighttpd gets SIGTERM (it shuts down cleanly in <1s) and
 # the scheduler exits its current sleep. Container exit code 0.
 #
 # All output is line-buffered and goes to stdout so Komodo / docker logs
@@ -41,7 +43,8 @@ LOG_TAG="[$(date -u +%FT%TZ)]"
 # ---------------------------------------------------------------------
 # Subprocess plumbing
 # ---------------------------------------------------------------------
-DARKHTTD_PID=""
+DARKHTTD_PID=""  # legacy name; now holds the lighttpd PID. Renaming would
+                 # break the cleanup() function below, so kept as-is.
 SCHED_PID=""
 
 cleanup() {
@@ -146,17 +149,18 @@ scheduler_loop() {
 }
 
 # ---------------------------------------------------------------------
-# Start darkhttpd (foreground but we'll background it so we can wait
-# on it; it'll block until killed).
+# Start lighttpd (foreground but we'll background it so we can wait
+# on it; it'll block until killed). serve.sh is the wrapper that does
+# the chdir to /repo + bind to ${PORT}.
 # ---------------------------------------------------------------------
-echo "${LOG_TAG} [run] starting darkhttpd on :${PORT}"
+echo "${LOG_TAG} [run] starting lighttpd on :${PORT}"
 /usr/local/bin/serve.sh &
-DARKHTTD_PID=$!
+DARKHTTD_PID=$!   # variable name kept for back-compat with cleanup() below
 
-# Give darkhttpd a moment to bind + log "darkhttpd/1.x starting".
+# Give lighttpd a moment to bind + log "server started".
 sleep 1
 if ! kill -0 "${DARKHTTD_PID}" 2>/dev/null; then
-    echo "${LOG_TAG} [run] darkhttpd exited immediately; aborting" >&2
+    echo "${LOG_TAG} [run] lighttpd exited immediately; aborting" >&2
     exit 1
 fi
 
@@ -164,11 +168,11 @@ fi
 scheduler_loop &
 SCHED_PID=$!
 
-# Wait for either child to exit (darkhttpd death = fatal; scheduler
+# Wait for either child to exit (lighttpd death = fatal; scheduler
 # death = just log and continue).
 while true; do
     if ! kill -0 "${DARKHTTD_PID}" 2>/dev/null; then
-        echo "${LOG_TAG} [run] darkhttpd died; shutting down" >&2
+        echo "${LOG_TAG} [run] lighttpd died; shutting down" >&2
         cleanup TERM
     fi
     if ! kill -0 "${SCHED_PID}" 2>/dev/null; then
