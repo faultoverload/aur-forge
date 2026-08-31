@@ -7,6 +7,9 @@
 #
 # Same bind-mounts as 'build', same env vars. Reuses build.sh's logic
 # for per-package build/sign/repo-add (we just thin the package list first).
+#
+# All RPC/version parsing helpers live in scripts/lib-aur.sh — keep this
+# file focused on the update workflow.
 set -euo pipefail
 
 REPO_NAME="${REPO_NAME:-custom}"
@@ -35,96 +38,55 @@ if ! gpg --list-secret-keys "${REPO_EMAIL}" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Read pkglist, strip blanks/comments.
-mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$PKGLIST")
-echo "[update] $((${#PKGS[@]})) package(s) in pkglist"
+# Source shared helpers. lib-aur.sh defaults REPO_NAME, PKGLIST, REPO_DIR
+# from env vars; we keep our local copies aligned.
+LIB_AUR_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/scripts" && pwd)/lib-aur.sh"
+# shellcheck disable=SC1090
+. "$LIB_AUR_PATH"
+
+# Read pkglist into PKGS array (space-separated string for lib-aur.sh
+# backwards-compat; we use it as both an array here and pass via env).
+mapfile -t PKGS < <(parse_pkglist "$PKGLIST")
+echo "[update] ${#PKGS[@]} package(s) in pkglist"
 
 # ---------------------------------------------------------------------
 # Phase 1: query AUR RPC for all packages at once.
-# The RPC supports up to ~100 args per call (multiinfo). We'll batch.
-# Returns JSON: {"results":[{...,"Name":..., "Version":..., "OutOfDate":...}]}
-# Rate-limit: be polite — one batch per call, sleep between batches.
+# Delegates to lib-aur.sh::query_aur_versions (batched + polite sleep).
 # ---------------------------------------------------------------------
-AUR_BASE="https://aur.archlinux.org/rpc/?v=5&type=multiinfo"
-USER_AGENT="aur-forge/1.0 (https://github.com/faultoverload/aur-forge)"
-
 declare -A AUR_VER AUR_OOD
-BATCH_SIZE=20
-total=${#PKGS[@]}
-i=0
-while (( i < total )); do
-    batch=( "${PKGS[@]:i:BATCH_SIZE}" )
-    i=$((i + BATCH_SIZE))
-    # Build URL with arg[]= encoding.
-    url="${AUR_BASE}"
-    for p in "${batch[@]}"; do
-        # URL-encode: AUR package names are [a-z0-9_+.-]+ so we only need
-        # to be careful with plus signs. Use jq for proper encoding.
-        enc="$(printf '%s' "$p" | jq -sRr @uri)"
-        url="${url}&arg%5B%5D=${enc}"
-    done
-
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "[update] would fetch $url"
-        continue
-    fi
-
-    resp="$(curl -fsS -A "$USER_AGENT" --max-time 30 "$url")" || {
-        echo "[update] AUR RPC call failed (batch starting at $((i - ${#batch[@]})))" >&2
-        continue
-    }
-
-    # Parse: iterate .results[], set AUR_VER[Name]=Version, AUR_OOD[Name]=OutOfDate.
-    # OutOfDate is either null or a unix timestamp (int).
-    while IFS=$'\t' read -r name ver ood; do
-        [[ -z "$name" ]] && continue
-        AUR_VER["$name"]="$ver"
-        AUR_OOD["$name"]="$ood"
-    done < <(printf '%s' "$resp" | jq -r '.results[]? | [.Name, .Version, (.OutOfDate|tostring)] | @tsv' 2>/dev/null || true)
-
-    # Be polite — AUR RPC has a soft ~2 req/sec limit.
-    sleep 1
-done
-
 if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[update] dry-run: would query AUR for ${#PKGS[@]} packages"
     exit 0
 fi
 
+while IFS=$'\t' read -r name ver ood; do
+    [[ -z "$name" ]] && continue
+    AUR_VER["$name"]="$ver"
+    AUR_OOD["$name"]="$ood"
+done < <(query_aur_versions "${PKGS[@]}")
+
 # ---------------------------------------------------------------------
 # Phase 2: figure out which packages need rebuilding.
-# Repo filenames: <name>-<ver>-<arch>.pkg.tar.zst
-#   e.g. yay-13.0.1-1-x86_64.pkg.tar.zst
-# We split on '-x86_64.pkg.tar.zst' suffix to peel off arch, then the
-# remainder is '<name>-<ver>'. To recover the version without being
-# confused by package names that contain hyphens (rare but possible),
-# match against the known name prefix.
+# parse_local_versions emits "<name>\t<version>" lines. Use the existing
+# PKGS array as the name list to disambiguate hyphenated names.
 # ---------------------------------------------------------------------
 declare -A REPO_VER
-shopt -s nullglob
-for f in "$REPO_DIR"/*.pkg.tar.zst; do
-    base="${f##*/}"
-    # Strip trailing arch + suffix: split off last two hyphens
-    # e.g. "yay-13.0.1-1-x86_64.pkg.tar.zst" -> "yay-13.0.1-1"
-    noarch="${base%-x86_64.pkg.tar.zst}"
-    noarch="${noarch%%-any.pkg.tar.zst}"
-    # Now noarch is "<name>-<version>". Split at first hyphen after the name.
-    for pname in "${PKGS[@]}"; do
-        # Quote the prefix separately to avoid it being treated as a pattern
-        # (AUR package names are [a-z0-9_+.-]+ so this is purely defensive).
-        if [[ "$noarch" == "${pname}-"* ]]; then
-            REPO_VER["$pname"]="${noarch#"${pname}"-}"
-        fi
-    done
-done
+PKGS_STR="${PKGS[*]}"
+# Export PKGS as a space-separated string for lib-aur.sh::parse_local_versions.
+# We deliberately switch types here — update.sh uses PKGS as an array, but
+# lib-aur.sh accepts either form and we pass the string for the helper.
+# shellcheck disable=SC2178
+export PKGS="$PKGS_STR"
+while IFS=$'\t' read -r name ver; do
+    [[ -z "$name" ]] && continue
+    REPO_VER["$name"]="$ver"
+done < <(parse_local_versions "$REPO_DIR")
+unset PKGS
 
 # ---------------------------------------------------------------------
 # Phase 3: build the rebuild list.
 # ---------------------------------------------------------------------
 TO_BUILD=()
-# SKIPPED is reserved for future use (e.g., per-package ignore flags).
-# shellcheck disable=SC2034
-SKIPPED=()
 SKIPPED_OOD=()
 SKIPPED_UP_TO_DATE=()
 NOT_FOUND=()

@@ -10,7 +10,7 @@
 FROM archlinux:latest
 
 LABEL org.opencontainers.image.title="aur-forge"
-LABEL org.opencontainers.image.description="Containerized AUR build farm — builds AUR packages in clean chroots and serves a signed custom pacman repo."
+LABEL org.opencontainers.image.description="Containerized AUR build farm — builds AUR packages in clean chroots and serves a signed custom pacman repo + a web UI for package status, build triggers, and adding new packages."
 LABEL org.opencontainers.image.source="https://github.com/faultoverload/aur-forge"
 
 # Disable pacman's DownloadUser sandbox. Pacman 7+ sandboxes downloads
@@ -27,7 +27,8 @@ LABEL org.opencontainers.image.source="https://github.com/faultoverload/aur-forg
 RUN sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf
 
 # devtools     — extra-x86_64-build (clean chroot builds)
-# darkhttpd    — static file server for the repo
+# lighttpd     — static + CGI web server (replaces darkhttpd; serves
+#                both the pacman repo and the new web UI at /)
 # gnupg        — signing + keyring
 # pinentry     — unattended passphrase via loopback/tty
 # sudo         — makepkg refuses to build as root; we drop to a temp
@@ -46,7 +47,7 @@ RUN pacman -Syu --noconfirm \
         base-devel \
         devtools \
         sudo \
-        darkhttpd \
+        lighttpd \
         git \
         gnupg \
         jq \
@@ -120,7 +121,9 @@ RUN pacman-key --init \
 RUN useradd -m -s /bin/bash builder \
  && echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
 
-# Darkhttpd will run as nobody for serving the static repo.
+# lighttpd runs under the container's runtime uid (999:1000 per compose)
+# via `server.uid` / `server.gid` in lighttpd.conf — no /etc/passwd entry
+# needed.
 WORKDIR /repo
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -130,6 +133,20 @@ COPY update.sh     /usr/local/bin/update.sh
 COPY serve.sh      /usr/local/bin/serve.sh
 COPY run.sh        /usr/local/bin/run.sh
 COPY scripts/      /usr/local/lib/aur-forge/
+COPY cgi-bin/      /usr/lib/aur-forge/cgi-bin/
+COPY www/          /usr/share/aur-forge/www/
+COPY lighttpd.conf /etc/aur-forge/lighttpd.conf
+
+# Generate the CSRF secret at build time. Every container built from this
+# image gets its OWN secret baked in — not shared across images, not
+# shared with anyone who can read the Dockerfile. This is a real
+# cryptographic secret; do NOT commit /etc/aur-forge/csrf-secret to git.
+# Mode 0600, root-owned; only processes running as root (the lighttpd
+# worker after the UID drop, or the CGI scripts reading it on demand)
+# can read it.
+RUN mkdir -p /etc/aur-forge \
+ && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /etc/aur-forge/csrf-secret \
+ && chmod 0600 /etc/aur-forge/csrf-secret
 
 # systemd-as-PID-1 setup for the 24/7 'run' mode.
 # ------------------------------
@@ -168,12 +185,13 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh \
               /usr/local/bin/init.sh /usr/local/bin/update.sh \
               /usr/local/bin/serve.sh /usr/local/bin/run.sh \
     && chmod +x /usr/local/lib/aur-forge/*.sh \
+    && chmod +x /usr/lib/aur-forge/cgi-bin/*.cgi \
     && ln -sf /usr/local/lib/aur-forge/approval-store.sh      /usr/local/bin/approval-store.sh \
     && ln -sf /usr/local/lib/aur-forge/srcinfo-diff.sh        /usr/local/bin/srcinfo-diff.sh \
     && ln -sf /usr/local/lib/aur-forge/open-quarantine-issue.sh /usr/local/bin/open-quarantine-issue.sh \
     && ln -sf /usr/local/lib/aur-forge/drain-quarantine.sh    /usr/local/bin/drain-quarantine.sh
 
-# darkhttpd serves on 8080 internally; Traefik in front publishes 443.
+# lighttpd serves on 8080 internally; Traefik in front publishes 443.
 EXPOSE 8080
 
 # Default to showing usage; argv[1] decides init|build|serve.
