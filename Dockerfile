@@ -136,18 +136,16 @@ COPY scripts/      /usr/local/lib/aur-forge/
 COPY cgi-bin/      /usr/lib/aur-forge/cgi-bin/
 COPY www/          /usr/share/aur-forge/www/
 COPY lighttpd.conf /etc/aur-forge/lighttpd.conf
-COPY install-repo.sh /usr/share/aur-forge/www/install-repo.sh
 
-# Generate the CSRF secret at build time. Every container built from this
-# image gets its OWN secret baked in — not shared across images, not
-# shared with anyone who can read the Dockerfile. This is a real
-# cryptographic secret; do NOT commit /etc/aur-forge/csrf-secret to git.
-# Mode 0600, root-owned; only processes running as root (the lighttpd
-# worker after the UID drop, or the CGI scripts reading it on demand)
-# can read it.
-RUN mkdir -p /etc/aur-forge \
- && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /etc/aur-forge/csrf-secret \
- && chmod 0600 /etc/aur-forge/csrf-secret
+# CSRF secret is NOT baked into the image. It's generated on first
+# container start by init.sh and persisted to /keys/csrf-secret (a
+# bind-mount that survives container recreation). This way:
+#   - Image rebuilds don't invalidate CSRF tokens in users' browser
+#     tabs (a stale token from before the rebuild still validates).
+#   - Different containers of the same image (if any) still get
+#     distinct secrets.
+#   - The secret file's permissions are set by init.sh so they're
+#     consistent regardless of image build context.
 
 # systemd-as-PID-1 setup for the 24/7 'run' mode.
 # ------------------------------

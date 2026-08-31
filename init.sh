@@ -58,6 +58,25 @@ chmod 0644 /keys/aur-forge.pub
 # file already exists.
 [[ -f /etc/machine-id ]] || systemd-machine-id-setup
 
+# ---------------------------------------------------------------------
+# Generate the CSRF secret on first run if it doesn't already exist.
+# Stored at /keys/csrf-secret so the file lives on a persistent
+# bind-mount (/keys is bind-mounted to
+# /opt/docker/data/aur-forge/keys on the host). Image rebuilds don't
+# invalidate CSRF tokens that users have in browser tabs from before
+# the rebuild. lighttpd's setenv.add-environment exports
+# CSRF_SECRET_FILE=/keys/csrf-secret to all CGI scripts.
+# ---------------------------------------------------------------------
+CSRF_SECRET_FILE="/keys/csrf-secret"
+if [[ ! -s "$CSRF_SECRET_FILE" ]]; then
+    echo "[init] generating CSRF secret at $CSRF_SECRET_FILE"
+    umask 077
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$CSRF_SECRET_FILE"
+    chmod 0600 "$CSRF_SECRET_FILE"
+else
+    echo "[init] reusing existing CSRF secret at $CSRF_SECRET_FILE"
+fi
+
 # Expose the pubkey through the served root (/repo). lighttpd is rooted
 # at /repo and cannot serve /keys directly because /keys is a separate
 # bind mount; symlinking the pubkey into the repo tree lets clients

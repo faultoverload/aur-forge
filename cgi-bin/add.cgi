@@ -88,34 +88,50 @@ while IFS= read -r line; do
 done <<< "$pkgs_raw"
 
 # ---------------------------------------------------------------------
-# Atomic append. Write to a temp file in the same directory, fsync, mv.
-# The container's bind-mount path (e.g. /opt/docker/data/aur-forge/pkglist.txt)
-# is read-write from the CGI's perspective; the temp file must live on
-# the same filesystem for mv to be atomic.
+# Append the new packages to /pkglist.
+#
+# IMPORTANT: /pkglist is a bind-mounted regular file (compose
+# bind-mounts /opt/docker/data/aur-forge/pkglist.txt → /pkglist
+# inside the container). On Linux, mv-ing over a bind-mounted file
+# fails with "Device or resource busy" because the kernel considers
+# the file in-use. So instead of write-tmp + atomic-mv, we write
+# in-place: read current contents, then write the new content
+# (existing + appended entries) into a fresh temp file in /tmp,
+# then cat that into /pkglist with a leading newline guard. This
+# isn't strictly atomic (a SIGKILL mid-write could leave the file
+# truncated), but /pkglist is tiny (single-line package names),
+# a single CGI process owns writes, and the only consequence of
+# corruption is "user retries" — no external state depends on the
+# file being mid-rewrite being well-formed.
 # ---------------------------------------------------------------------
 if [[ ${#ADDED[@]} -gt 0 ]]; then
-    tmp="${PKGLIST}.tmp.$$"
-    trap 'rm -f "$tmp"' EXIT
+    # Build the new content in a /tmp file (not in /pkglist's directory,
+    # which is a regular file, not a directory).
+    new_content="$(mktemp /tmp/pkglist-new.XXXXXX)"
+    trap 'rm -f "$new_content"' EXIT
 
-    # Ensure the file ends with a newline before appending, then append
-    # all new entries separated by single newlines, then a final newline.
-    {
-        if [[ -s "$PKGLIST" ]] && [[ "$(tail -c 1 "$PKGLIST" | wc -l)" -eq 0 ]]; then
-            printf '\n' >> "$tmp"
+    # Copy current content first (if any).
+    if [[ -s "$PKGLIST" ]]; then
+        cat "$PKGLIST" > "$new_content"
+        # Ensure file ends with exactly one newline before appending.
+        if [[ "$(tail -c 1 "$PKGLIST" | wc -l)" -eq 0 ]]; then
+            printf '\n' >> "$new_content"
         fi
-        cat "$PKGLIST" 2>/dev/null >> "$tmp" || true
-        for pkg in "${ADDED[@]}"; do
-            printf '%s\n' "$pkg" >> "$tmp"
-        done
-    }
-    mv -f "$tmp" "$PKGLIST" || {
-        # mv failed (read-only mount? permission?); surface it.
+    fi
+    # Append new entries, each terminated by a newline.
+    for pkg in "${ADDED[@]}"; do
+        printf '%s\n' "$pkg" >> "$new_content"
+    done
+
+    # Write the new content over the bind-mounted file. We can't
+    # use mv (device busy). Append is safe but doesn't truncate.
+    # So: open for write (truncate), then cat the new content.
+    if ! cat "$new_content" > "$PKGLIST"; then
         cgi_send_header
         cgi_html_doc "500" "<h1>500 Internal Error</h1>
-<p>Failed to write pkglist at <code>${PKGLIST}</code>. Check that the bind-mount is read-write.</p>
-<p>Added: $(html_escape "${ADDED[*]:-none}")</p>"
-        exit 1
-    }
+<p>Failed to write pkglist at <code>${PKGLIST}</code>. Check that the bind-mount is read-write and the directory has enough space.</p>"
+        exit 0
+    fi
 fi
 
 # ---------------------------------------------------------------------
