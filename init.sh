@@ -35,6 +35,23 @@ REPO_EMAIL="${REPO_EMAIL:-woodsyx@gmail.com}"
 GPG_KEY_NAME="${GPG_KEY_NAME:-aur-forge}"
 GPG_PASSPHRASE="${GPG_PASSPHRASE:-}"   # empty = unprotected key (homelab OK)
 
+# AUR fetch clone policy (consumed by scripts/aur-fetch-wrapper.sh
+# via the build pipeline). `discard` is the recommended default for
+# fresh nightly rebuilds: aur-fetch will reset any local commits
+# in the workdir and pin to upstream `master@{upstream}` rather than
+# attempting to merge / rebase. Operators raising this for ad-hoc
+# testing may use `merge` or `rebase`, but those can clobber an
+# operator's local notes and are explicitly NOT the default for
+# noninteractive nightly builds.
+AUR_FETCH_CLONE_POLICY="${AUR_FETCH_CLONE_POLICY:-discard}"
+case "${AUR_FETCH_CLONE_POLICY}" in
+    discard|merge|rebase|auto|reset) : ;;
+    *)
+        echo "[init] WARNING: AUR_FETCH_CLONE_POLICY='${AUR_FETCH_CLONE_POLICY}' is not one of discard|merge|rebase|auto|reset; falling back to discard" >&2
+        AUR_FETCH_CLONE_POLICY=discard ;;
+esac
+export AUR_FETCH_CLONE_POLICY
+
 export GNUPGHOME="/keys"
 mkdir -p /keys /repo /cache
 chmod 700 /keys

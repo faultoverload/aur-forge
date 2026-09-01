@@ -384,7 +384,30 @@ When the gate quarantines a malicious update:
 | `CSRF_SECRET_FILE`      | `/etc/aur-forge/csrf-secret` | Path to the CSRF secret. Auto-created at build time with mode 0600. Do NOT commit. |
 | `AUR_BUILD_JOBS`        | `2`                      | Compile and zstd compression job count. Bound to the same value so `MAKEFLAGS=-jN`, `NPROC=N`, and `COMPRESSZST` stay in lockstep. Validated by `scripts/makepkg-jobs-config.sh`; anything outside `[1, MAX_AUR_BUILD_JOBS]` is rejected before the first `extra-x86_64-build`. |
 | `MAX_AUR_BUILD_JOBS`     | `8`                      | Upper cap for `AUR_BUILD_JOBS`. The container's 4 GiB mem_limit and pid cap limit the safe value; raise only if you also raise `mem_limit` and confirm the cgroup survives a parallel build. |
+| `AUR_FETCH_CLONE_POLICY` | `discard`               | How `scripts/aur-fetch-wrapper.sh` reconciles an existing `WORK` clone with upstream. Default `discard` resets local commits to `master@{upstream}` (safe for nightly rebuilds). Allowed: `discard` (default), `merge`, `rebase`, `auto`, `reset`. Invalid values log a warning and fall back to `discard`. |
 | `AUR_FORGE_PACMAN_CACHE_DIR` | `/cache/pacman/pkg/` | Bind-mounted persistent pacman package cache. Set by `init.sh`; ensures `arch-nspawn`'s first-cache-dir bind points at host-backed storage instead of the overlay. |
+
+## Pinned dependencies
+
+The image picks up AUR-only packages through committed pins, never
+unpinned `git clone`. Today the only pinned AUR dependency is
+aurutils, tracked at the project root:
+
+- `aurutils.version` — `AURUTILS_VERSION` (upstream tag),
+  `AURUTILS_COMMIT` (40-char hex), `AURUTILS_SHA256` (64-char
+  hex tarball hash), `AURUTILS_SOURCE_URL` (commit-pinned).
+- `scripts/install-aurutils.sh` — fetches the upstream tarball
+  by tag, asserts the SHA-256, builds via `makepkg --nocheck`,
+  and stages `/usr/local/lib/aur-forge/aurutils.pin`.
+
+To bump the pinned aurutils: update `aurutils.version` with the
+new tag/commit/sha tuple and the new source URL, then rebuild
+the image. The Dockerfile never unpinned-clones aurutils.
+
+`archcanary` is also built from source in the Dockerfile; it is
+cloned once with `--depth 1` from the maintained upstream and
+built locally with `makepkg -si --skippgpcheck`. To bump archcanary,
+update the upstream URL in the Dockerfile, not a version file.
 
 ## Web UI
 

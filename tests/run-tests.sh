@@ -1020,6 +1020,502 @@ for forbidden_dropin_path in '/etc/makepkg.conf' '/etc/makepkg.conf.d' \
     fi
 done
 
+
+
+echo
+echo "=== pinned aurutils install + aur-fetch seam (kanban t_74c2fd9c) ==="
+# ---------------------------------------------------------------
+# Phase-2 selective aurutils adoption: install aurutils from a
+# pinned AUR commit (not master/unpinned main), expose it under
+# /usr/local/lib/aur-forge/aurutils/ with a SHA-256 + version
+# stamp, and replace the `git clone --depth 1` fetch seam in
+# build.sh with `aur-fetch`. The archcanary -> PKGBUILD-diff
+# quarantine -> approval -> extra-x86_64-build gate sequence
+# stays intact. Forbidden in this card:
+#   - aur-sync, aur-view, AUR_PACMAN_AUTH, expect
+#   - curl | bash / curl | sh / pipe-to-shell
+#   - master / unpinned main
+#
+# Tests pin:
+#   1. aurutils.version pin file is committed alongside the
+#      helper and contains the exact commit + sha256 tuple.
+#   2. install-aurutils.sh exists and bash -n passes.
+#   3. Helper validates the pin tuple syntactically (each line
+#      present, sha256 is a 64-char hex string, commit is a
+#      40-char hex string) and rejects malformed pins.
+#   4. Helper refuses to fetch from `master` / unpinned `main`
+#      URLs — the URL slot must be commit-pinned.
+#   5. Helper never runs `curl | bash` / `curl | sh` /
+#      pipe-to-shell — its source is grep-clean.
+#   6. build.sh no longer contains the literal
+#      `git clone --depth 1 https://aur.archlinux.org/${pkg}.git`
+#      seam (or its expanded form) — replaced by an `aur-fetch`
+#      invocation as a single, top-level command (NOT chained
+#      with $(...) or <(...) substitutions, per the 2026-08-30
+#      build-trigger failure pattern).
+#   7. archcanary gate still runs AFTER fetch and BEFORE
+#      extra-x86_64-build (gate sequencing is preserved).
+#   8. build.sh: WORK=/cache/work/${pkg} + chown builder:builder
+#      flow still present.
+#   9. Forbidden patterns (aur-sync, aur-view, AUR_PACMAN_AUTH,
+#      expect) are absent from build.sh + Dockerfile + the new
+#      helper.
+#  10. Dockerfile uses the new install helper (instead of its
+#      own unpinned git clone).
+#  11. README documents where the aurutils version comes from.
+#  12. init.sh declares the existing-clone policy knob
+#      (AUR_FETCH_CLONE_POLICY) with documented default
+#      (discard-for-nightly-rebuilds).
+# ---------------------------------------------------------------
+
+AURUTILS_INSTALL="${SCRIPTS}/install-aurutils.sh"
+[[ -s "$AURUTILS_INSTALL" ]] \
+    && pass "scripts/install-aurutils.sh exists" \
+    || fail "scripts/install-aurutils.sh exists" "missing helper"
+
+if bash -n "$AURUTILS_INSTALL" 2>/dev/null; then
+    pass "bash -n $AURUTILS_INSTALL"
+else
+    fail "bash -n $AURUTILS_INSTALL" "syntax error"
+fi
+
+# Source the helper as a library — same pattern as the other
+# config helpers. The helper is intended to be sourced by
+# Dockerfile tests + by build.sh (which calls a public entry
+# point like install_pinned_aurutils). Sourcing also lets the
+# test exercise pure functions without actually running
+# makepkg.
+if [[ -s "$AURUTILS_INSTALL" ]]; then
+    # shellcheck disable=SC1090
+    . "$AURUTILS_INSTALL"
+fi
+
+# aurutils.version pin file: ships next to the helper so a
+# future upgrade is a 2-line PR (commit SHA + sha256 tuple).
+AURUTILS_VERSION_FILE="${REPO_ROOT}/aurutils.version"
+if [[ -s "$AURUTILS_VERSION_FILE" ]]; then
+    pass "aurutils.version pin file is committed"
+    # Pin format: key=value lines, one per logical fact.
+    #   AURUTILS_VERSION=20.5.8-1
+    #   AURUTILS_COMMIT=<40-char hex>
+    #   AURUTILS_SHA256=<64-char hex>
+    #   AURUTILS_SOURCE_URL=<https URL ending in the commit hash,
+    #                        NOT master / NOT main>
+    if grep -E '^AURUTILS_VERSION=' "$AURUTILS_VERSION_FILE" >/dev/null; then
+        pass "aurutils.version declares AURUTILS_VERSION"
+    else
+        fail "aurutils.version declares AURUTILS_VERSION" \
+            "missing AURUTILS_VERSION=<x.y.z-N> line"
+    fi
+    if grep -E '^AURUTILS_COMMIT=[0-9a-f]{40}$' "$AURUTILS_VERSION_FILE" >/dev/null; then
+        pass "aurutils.version declares AURUTILS_COMMIT (40-char hex)"
+    else
+        fail "aurutils.version declares AURUTILS_COMMIT (40-char hex)" \
+            "missing or malformed AURUTILS_COMMIT"
+    fi
+    if grep -E '^AURUTILS_SHA256=[0-9a-f]{64}$' "$AURUTILS_VERSION_FILE" >/dev/null; then
+        pass "aurutils.version declares AURUTILS_SHA256 (64-char hex)"
+    else
+        fail "aurutils.version declares AURUTILS_SHA256 (64-char hex)" \
+            "missing or malformed AURUTILS_SHA256"
+    fi
+    if grep -E '^AURUTILS_SOURCE_URL=' "$AURUTILS_VERSION_FILE" >/dev/null; then
+        pass "aurutils.version declares AURUTILS_SOURCE_URL"
+    else
+        fail "aurutils.version declares AURUTILS_SOURCE_URL" \
+            "missing AURUTILS_SOURCE_URL"
+    fi
+    # The source URL MUST include the commit hash. A pinned URL
+    # is the whole point of this file — anything that resolves
+    # to a moving ref (master / main / refs/heads/<branch>) is
+    # forbidden by the task body.
+    src_url="$(grep -E '^AURUTILS_SOURCE_URL=' "$AURUTILS_VERSION_FILE" | head -1 \
+        | sed -E 's/^AURUTILS_SOURCE_URL=//')"
+    case "$src_url" in
+        */commit/*[0-9a-f][0-9a-f][0-9a-f]*)
+            pass "AURUTILS_SOURCE_URL is commit-pinned (contains /commit/<hex>)" ;;
+        *)
+            fail "AURUTILS_SOURCE_URL is commit-pinned" \
+                "got: $src_url" ;;
+    esac
+    # Belt-and-braces: explicit forbid for the two ref names
+    # the task body names.
+    if grep -E '^AURILS_SOURCE_URL=.*(master|main)(/|$)' \
+            "$AURUTILS_VERSION_FILE" >/dev/null 2>&1; then
+        fail "AURUTILS_SOURCE_URL must not reference master/main" \
+            "moving-ref URL slipped into the pin"
+    else
+        pass "AURUTILS_SOURCE_URL does not reference master/main"
+    fi
+else
+    fail "aurutils.version pin file is committed" "missing file"
+    fail "aurutils.version declares AURUTILS_VERSION" "skipped — no pin file"
+    fail "aurutils.version declares AURUTILS_COMMIT (40-char hex)" "skipped — no pin file"
+    fail "aurutils.version declares AURUTILS_SHA256 (64-char hex)" "skipped — no pin file"
+    fail "aurutils.version declares AURUTILS_SOURCE_URL" "skipped — no pin file"
+    fail "AURUTILS_SOURCE_URL is commit-pinned" "skipped — no pin file"
+    fail "AURUTILS_SOURCE_URL does not reference master/main" "skipped — no pin file"
+fi
+
+# Helper pure-function surface: parse_aurutils_pin reads the
+# file and echoes KEY=VALUE pairs, refusing to fabricate a pin
+# from an absent file. Reject malformed pins before any
+# network or makepkg step runs.
+if declare -F parse_aurutils_pin >/dev/null 2>&1; then
+    # Happy path: parse the real pin file (if it exists) and
+    # verify all four keys are present + well-formed.
+    if [[ -s "$AURUTILS_VERSION_FILE" ]]; then
+        parsed="$(parse_aurutils_pin "$AURUTILS_VERSION_FILE" || true)"
+        for key in AURUTILS_VERSION AURUTILS_COMMIT AURUTILS_SHA256 AURUTILS_SOURCE_URL; do
+            if grep -qE "^${key}=" <<<"$parsed"; then
+                pass "parse_aurutils_pin emits $key"
+            else
+                fail "parse_aurutils_pin emits $key" \
+                    "missing key in parsed output: $(printf '%s' \"$parsed\" | head -c 200)"
+            fi
+        done
+    fi
+
+    # Sad paths: malformed pins must NOT silently succeed. Each
+    # bad pin is written to a tmp file and fed to the parser;
+    # the parser must refuse it. The multi-line pin in particular
+    # uses an actual newline so the parser's `while IFS='=' read`
+    # loop sees each row independently.
+    tmp_pin="$(mktemp)"
+    bad_pins=(
+        'AURUTILS_VERSION=20.5.8-1'
+        'AURUTILS_COMMIT=not-hex'
+        "AURUTILS_VERSION=20.5.8-1
+AURUTILS_COMMIT=748cb7f5d3ab29f55518f472669c54175c5df538
+AURUTILS_SHA256=tooshort
+AURUTILS_SOURCE_URL=https://github.com/AladW/aurutils/archive/refs/tags/20.5.8.tar.gz"
+        ''
+    )
+    for bad_contents in "${bad_pins[@]}"; do
+        printf '%s\n' "$bad_contents" > "$tmp_pin"
+        if parse_aurutils_pin "$tmp_pin" >/dev/null 2>&1; then
+            fail "parse_aurutils_pin rejects malformed pin" \
+                "accepted: $(printf '%s' "$bad_contents" | head -c 100)"
+        else
+            pass "parse_aurutils_pin rejects malformed pin ($(printf '%s' "$bad_contents" | wc -c) bytes)"
+        fi
+    done
+    rm -f "$tmp_pin"
+
+    # Missing file → parser must fail (not crash).
+    if parse_aurutils_pin "/nonexistent/path/aurutils.version" >/dev/null 2>&1; then
+        fail "parse_aurutils_pin rejects missing pin file" "accepted absent file"
+    else
+        pass "parse_aurutils_pin rejects missing pin file"
+    fi
+else
+    fail "parse_aurutils_pin exists" "function missing"
+fi
+
+# Source-static safety: the helper itself must not embed any
+# pipe-to-shell pattern. grep -E covers `curl | bash`,
+# `curl|bash`, `wget | sh`, etc. — anything where stdout of a
+# download is piped into a shell.
+helper_text="$(cat "$AURUTILS_INSTALL" 2>/dev/null || true)"
+for forbidden_pipe in 'curl | bash' 'curl|bash' 'curl | sh' 'curl|sh' \
+                       'wget | bash' 'wget|bash' 'wget | sh' 'wget|sh'; do
+    if grep -F -q -- "$forbidden_pipe" <<<"$helper_text"; then
+        fail "install-aurutils.sh does not contain '$forbidden_pipe'" \
+            "pipe-to-shell pattern leaked into helper"
+    else
+        pass "install-aurutils.sh does not contain '$forbidden_pipe'"
+    fi
+done
+
+# Master-branch forbid: the helper must not pull from master
+# or unpinned main. Static grep covers all `master`/`main`
+# occurrences in the helper source.
+if grep -nE '\b(master|main)\b' <<<"$helper_text" >/dev/null 2>&1; then
+    # If the token appears at all, it MUST be in a deny-list
+    # comment (e.g. "rejects master"). Verify each occurrence
+    # is part of a negation.
+    bad=""
+    while IFS= read -r line; do
+        # Strip leading whitespace + line number from grep
+        line="${line##*:}"
+        # Comment lines, "rejects/forbid/never/no" patterns are
+        # the only acceptable contexts. If the line looks like
+        # an actual command (no leading '#' and no negation
+        # phrase), flag it.
+        if [[ "${line// /}" =~ ^[a-zA-Z] ]] \
+           && ! grep -qE '(reject|forbid|never|no[ _-])' <<<"$line"; then
+            bad="${bad} | ${line}"
+        fi
+    done < <(grep -nE '\b(master|main)\b' <<<"$helper_text")
+    if [[ -z "$bad" ]]; then
+        pass "install-aurutils.sh references master/main only in negation context"
+    else
+        fail "install-aurutils.sh must not reference master/main as a fetch ref" \
+            "non-negation occurrences:${bad}"
+    fi
+else
+    pass "install-aurutils.sh does not reference master or main at all"
+fi
+
+# build.sh seam replacement: the literal
+#   git clone --depth 1 https://aur.archlinux.org/${pkg}.git
+# (or its expanded form) MUST be gone.
+build_text="$(cat "${REPO_ROOT}/build.sh" 2>/dev/null || true)"
+if grep -F -q 'git clone --depth 1 "https://aur.archlinux.org/${pkg}.git"' \
+        <<<"$build_text"; then
+    fail "build.sh no longer uses 'git clone --depth 1 ...aur.archlinux.org/\${pkg}.git'" \
+        "old seam still present (literal form)"
+else
+    pass "build.sh no longer uses literal 'git clone --depth 1 https://aur.archlinux.org/\${pkg}.git'"
+fi
+# Expanded form: also catch any operator who unquoted the URL.
+if grep -E -q 'git clone --depth 1 https?://aur\.archlinux\.org/' \
+        <<<"$build_text"; then
+    fail "build.sh no longer uses git clone --depth 1 against aur.archlinux.org" \
+        "expanded form still present"
+else
+    pass "build.sh no longer uses git clone --depth 1 against aur.archlinux.org"
+fi
+
+# build.sh must now invoke aur-fetch (or aurutils-installed
+# `aur fetch`). The replacement is the whole point of this
+# card.
+if grep -E -q '(aur-fetch|aur[[:space:]]+fetch)' <<<"$build_text"; then
+    pass "build.sh invokes aur-fetch"
+else
+    fail "build.sh invokes aur-fetch" "no aur-fetch invocation found"
+fi
+
+# CRITICAL: the 2026-08-30 build-trigger failure pattern was
+# that executing a foreign script on the same line as a
+# redirect silently breaks the parent pipeline. The card
+# explicitly forbids chaining aur-fetch with $(...) or
+# <(...) substitutions. Find any `aur-fetch` line that ends
+# with a redirect or substitution and fail.
+if grep -nE '(aur-fetch|aur[[:space:]]+fetch)' <<<"$build_text" \
+   | grep -E '(\$\(|\|<[(\[])' >/dev/null 2>&1; then
+    fail "aur-fetch is not chained with \$(...) or <(...) substitutions" \
+        "foreign-script + redirect bug pattern present"
+else
+    pass "aur-fetch is not chained with \$(...) or <(...) substitutions"
+fi
+
+# Gate sequencing: the run_gate dispatcher must appear AFTER the
+# fetch and BEFORE extra-x86_64-build, and exactly once. The gate
+# is the security anchor between fetch and chroot build, so static
+# ordering is part of the contract.
+#
+# Why `run_gate "$pkg"` and not `archcanary`?
+#   The per-package archcanary invocation lives INSIDE run_gate's
+#   function body (~line 290), so its source-text order is BEFORE
+#   the per-package loop and BEFORE the fetch. That's fine — it
+#   doesn't run until run_gate is called. The control-flow order
+#   is established by where run_gate is dispatched, which is
+#   what this test pins.
+fetch_line="$(grep -nE '^[[:space:]]*[^#[:space:]].*(aur-fetch|aur[[:space:]]+fetch)' \
+    <<<"$build_text" | head -1 | cut -d: -f1)"
+# `run_gate "$pkg"` matcher: don't try to escape the literal `$`
+# inside a $(...) subshell (the outer quoting layers turn
+# `"\\$pkg"` into something else). Use a fixed-string variant
+# on the dollar sign so the regex reliably matches.
+run_gate_line="$(grep -nF 'run_gate "$pkg"' <<<"$build_text" \
+    | grep -E '^[[:space:]]*[0-9]+:[[:space:]]*[^#[:space:]]' | head -1 | cut -d: -f1)"
+build_line="$(grep -nE '^[[:space:]]*[^#[:space:]].*extra-x86_64-build' \
+    <<<"$build_text" | head -1 | cut -d: -f1)"
+if [[ -n "$fetch_line" && -n "$run_gate_line" && -n "$build_line" ]]; then
+    if (( fetch_line < run_gate_line )) \
+       && (( run_gate_line < build_line )); then
+        pass "run_gate call site sits after fetch ($fetch_line) and before extra-x86_64-build ($build_line) at line $run_gate_line"
+    else
+        fail "run_gate call site ordering" \
+            "fetch=$fetch_line run_gate=$run_gate_line build=$build_line"
+    fi
+else
+    fail "run_gate call site ordering" \
+        "missing one of: fetch_line=$fetch_line run_gate_line=$run_gate_line build_line=$build_line"
+fi
+# run_gate dispatcher: must appear after fetch and before the
+# chroot build, and exactly once (it's the gate function — a
+# future PR that adds a second call site likely means the gate
+# is being bypassed somewhere).
+run_gate_count="$(grep -nF 'run_gate "$pkg"' <<<"$build_text" \
+    | grep -cE '^[[:space:]]*[0-9]+:[[:space:]]*[^#[:space:]]' || true)"
+if [[ -n "$run_gate_line" ]] \
+   && [[ "$run_gate_count" == "1" ]]; then
+    pass "run_gate dispatcher is invoked exactly once in the per-package loop"
+elif [[ "$run_gate_count" == "0" ]]; then
+    fail "run_gate dispatcher present" "no run_gate \"\$pkg\" call site"
+else
+    fail "run_gate dispatcher count" \
+        "found $run_gate_count call sites (expected exactly 1)"
+fi
+# Positive contract: run_gate's function body must contain an
+# actual archcanary scan. The earlier sequencing test relies on
+# run_gate being called in the right place, but the function
+# itself must do the archcanary scan for the gate to mean
+# anything. Pin that here so a future refactor can't silently
+# turn run_gate into a no-op.
+run_gate_body_start="$(grep -nF 'run_gate()' <<<"$build_text" | head -1 | cut -d: -f1)"
+if [[ -n "$run_gate_body_start" ]]; then
+    # Look at the next ~80 lines of build.sh (run_gate is a
+    # single function; in practice it's well under 80 lines).
+    if tail -n +"$run_gate_body_start" <<<"$build_text" | head -80 \
+        | grep -E -q '^[[:space:]]*[^#[:space:]].*archcanary[[:space:]]+--search-packages'; then
+        pass "run_gate function body contains an archcanary --search-packages scan"
+    else
+        fail "run_gate function body contains an archcanary --search-packages scan" \
+            "function at line $run_gate_body_start has no archcanary scan"
+    fi
+else
+    fail "run_gate function defined" "no `run_gate()` definition found"
+fi
+
+# WORK + chown builder:builder flow still present (the task
+# body says "preserving the existing WORK/chown builder:builder
+# flow and the archcanary gate").
+if grep -E -q 'WORK="/cache/work/\$\{pkg\}"' <<<"$build_text"; then
+    pass "build.sh preserves WORK=/cache/work/\${pkg}"
+else
+    fail "build.sh preserves WORK=/cache/work/\${pkg}" "missing"
+fi
+if grep -F -q 'chown -R builder:builder "$WORK"' <<<"$build_text"; then
+    pass "build.sh preserves chown -R builder:builder \"\$WORK\""
+else
+    fail "build.sh preserves chown -R builder:builder \"\$WORK\"" "missing"
+fi
+
+# Forbidden patterns across build.sh + Dockerfile + the new
+# helper. The task body explicitly forbids aur-sync, aur-view,
+# AUR_PACMAN_AUTH, expect, and pipe-to-shell. None may appear
+# as a real INVOCATION in the changed code surface.
+#
+# Subtlety: the helper ships a refuse_insecure_invocation
+# function whose comment block + case-pattern list name the
+# forbidden strings as a deny-list. We accept those (positive
+# contract) but reject any other non-comment line that
+# mentions them — that catches accidental introduction of
+# `aur-sync` etc. while preserving the explicit refusal helper.
+if declare -F refuse_insecure_invocation >/dev/null 2>&1; then
+    pass "install-aurutils.sh defines refuse_insecure_invocation (positive contract)"
+else
+    fail "install-aurutils.sh defines refuse_insecure_invocation" \
+        "missing enforcement function"
+fi
+forbidden_in_code=(aur-sync aur-view 'AUR_PACMAN_AUTH')
+for pat in "${forbidden_in_code[@]}"; do
+    bad_locations=()
+    for f in "${REPO_ROOT}/build.sh" "${REPO_ROOT}/Dockerfile" \
+             "${REPO_ROOT}/init.sh" "$AURUTILS_INSTALL" \
+             "${REPO_ROOT}/scripts/aur-fetch-wrapper.sh"; do
+        [[ -f "$f" ]] || continue
+        # Skip comment lines (lines starting with optional
+        # whitespace then `#`) AND the deny-list case-pattern
+        # line in refuse_insecure_invocation, which is the
+        # only place the string may legitimately appear.
+        # We do this by piping each candidate through a
+        # filter that drops:
+        #   - lines starting with '#' (comments)
+        #   - the single deny-list line in the helper
+        #     (starts with 8+ spaces then a `*'<pattern>'*` glob).
+        # The whole pipeline is wrapped in `|| true` to absorb
+        # `set -euo pipefail` and the empty-match case (the
+        # inner grep returning 1 normally aborts the pipeline
+        # under pipefail; this wrapper is the safe idiom).
+        # The deny-list arms live in `*'<pattern>'*) return 2 ;;`
+        # form. The carve-out matches lines that match the case-
+        # arm shape (even when the literal binary name has a `-`
+        # or space in it). Pattern: a non-comment line whose
+        # leading non-blank content is `*'<anything>'*) return 2 ;;`.
+        # We accept either `*'foo'*)` or a leading whitespace +
+        # `*'foo'` followed by anything before the `return 2` text.
+        # The simpler carve-out below uses an extended-regex
+        # anchored at line start: `*'.*'` (matches "starts with
+        # literal *' ... '").
+        filtered="$(grep -nE "^[[:space:]]*[^#[:space:]].*${pat}" "$f" 2>/dev/null \
+            | grep -vE "^\S+:.+\\*'.*'" \
+            || true)"
+        if [[ -n "$filtered" ]]; then
+            bad_locations+=("$f: $(printf '%s\n' "$filtered" | head -2 | tr '\n' '|')")
+        fi
+    done
+    if [[ ${#bad_locations[@]} -eq 0 ]]; then
+        pass "forbidden pattern '${pat}' only appears in deny-list (no real invocation) in changed code"
+    else
+        fail "forbidden pattern '${pat}' must not appear as a real invocation" \
+            "found in: ${bad_locations[*]}"
+    fi
+done
+
+# `expect` is a forbidden dep across the changed code surface
+# (the task body says no `expect`). Same deny-list carve-out.
+expect_locations=()
+for f in "${REPO_ROOT}/build.sh" "${REPO_ROOT}/Dockerfile" \
+         "${REPO_ROOT}/init.sh" "$AURUTILS_INSTALL" \
+         "${REPO_ROOT}/scripts/aur-fetch-wrapper.sh" \
+         "${REPO_ROOT}/README.md"; do
+    [[ -f "$f" ]] || continue
+    filtered="$(grep -nE "^[[:space:]]*[^#[:space:]].*\bexpect\b" "$f" 2>/dev/null \
+        | grep -vE "^\S+:.+\\*'.*'" \
+        || true)"
+    if [[ -n "$filtered" ]]; then
+        expect_locations+=("$f")
+    fi
+done
+if [[ ${#expect_locations[@]} -eq 0 ]]; then
+    pass "forbidden dependency 'expect' only appears in deny-list (no real invocation) in changed code"
+else
+    fail "forbidden dependency 'expect' must not appear as a real invocation" \
+        "found in: ${expect_locations[*]}"
+fi
+
+# Dockerfile must use the new install helper rather than
+# embedding its own unpinned `git clone ... aurutils.git`.
+dockerfile_text="$(cat "${REPO_ROOT}/Dockerfile")"
+if grep -F -q 'install-aurutils.sh' <<<"$dockerfile_text"; then
+    pass "Dockerfile uses scripts/install-aurutils.sh"
+else
+    fail "Dockerfile uses scripts/install-aurutils.sh" "no install helper reference"
+fi
+if grep -F -q 'aur.archlinux.org/aurutils.git' <<<"$dockerfile_text"; then
+    fail "Dockerfile no longer clones aurutils.git directly" \
+        "unpinned git clone of aurutils still present"
+else
+    pass "Dockerfile no longer clones aurutils.git directly"
+fi
+
+# README must document where the aurutils version comes from.
+# We don't pin a specific phrasing — just require that the
+# README mentions both `aurutils` and `aurutils.version`
+# (or `pinned`) so a reader can locate the pin.
+if grep -F -q 'aurutils.version' "${REPO_ROOT}/README.md" \
+   || grep -E -qi 'pinned aurutils' "${REPO_ROOT}/README.md"; then
+    pass "README documents the pinned aurutils version source"
+else
+    fail "README documents the pinned aurutils version source" \
+        "no reference to aurutils.version / pinned aurutils"
+fi
+
+# init.sh must declare the existing-clone policy knob with a
+# documented default. The task body recommends `discard` for
+# fresh nightly rebuilds.
+init_text="$(cat "${REPO_ROOT}/init.sh")"
+if grep -F -q 'AUR_FETCH_CLONE_POLICY' <<<"$init_text"; then
+    pass "init.sh declares AUR_FETCH_CLONE_POLICY knob"
+else
+    fail "init.sh declares AUR_FETCH_CLONE_POLICY knob" "missing"
+fi
+# The default value should be `discard` (per the task body's
+# recommendation). Verify by checking for both the env-var
+# read and a comment that names `discard` as the default.
+if grep -E -q 'AUR_FETCH_CLONE_POLICY.*discard' <<<"$init_text" \
+   || (grep -F -q 'AUR_FETCH_CLONE_POLICY' <<<"$init_text" \
+       && grep -F -q 'discard' <<<"$init_text"); then
+    pass "init.sh documents discard as the AUR_FETCH_CLONE_POLICY default"
+else
+    fail "init.sh documents discard as the AUR_FETCH_CLONE_POLICY default" \
+        "expected 'discard' default per task spec"
+fi
+
 echo
 echo "=== summary ==="
 echo "passed: $PASS"
