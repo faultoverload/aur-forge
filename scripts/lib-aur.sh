@@ -59,6 +59,54 @@ parse_pkglist() {
 }
 
 # ----------------------------------------------------------------------
+# parse_quarantine_title <title>
+# Parses an open-quarantine GitHub Issue title into its package name
+# and the canonical reason label. The real title format from
+# scripts/open-quarantine-issue.sh:59 is:
+#
+#   [QUARANTINE][<REASON>] <pkg>
+#
+# where <REASON> is one of the canonical upper-case-with-hyphens labels
+# (BLOCKLIST-MATCH, PKGBUILD-DEPS-CHANGED, PKGBUILD-CODE-CHANGED,
+# PKGBUILD-INSTALL-ADDED, PKGBUILD-INSTALL-EDITED, FIRST-BUILD-STRICT,
+# PKGBUILD-RE-FLAGGED) and <pkg> is an Arch package name (which can
+# contain '-', '_', '.', '+').
+#
+# On match: emits "<pkg><TAB><reason>" on stdout (TSV).
+# On no match: emits nothing (empty stdout, rc 0) so the caller's
+# `[[ -z "$pkg" ]] && continue` skip-path keeps working.
+#
+# Implemented with parameter expansion rather than a regex so the
+# Bash builtin does the heavy lifting — no fork to grep/sed, and the
+# "starts with [QUARANTINE]" anchor + "[...]" bracket pair are both
+# unambiguous in the production title.
+# ----------------------------------------------------------------------
+parse_quarantine_title() {
+    local title="${1-}"
+    [[ -n "$title" ]] || return 0
+    # Anchor: must start with "[QUARANTINE][".
+    [[ "$title" == "[QUARANTINE]["* ]] || return 0
+    # Strip the "[QUARANTINE][" prefix; what's left is "<reason>] <pkg>"
+    # (possibly with the closing bracket missing → bail).
+    local rest="${title#"[QUARANTINE]["}"
+    [[ "$rest" == *"]"* ]] || return 0
+    # Reason = everything up to the first "]"; pkg = everything after
+    # "] " (with exactly one space) to the end.
+    local reason="${rest%%]*}"
+    local pkg="${rest#*"] "}"
+    # Reject if reason is empty or contains characters outside the
+    # canonical hyphenated-upper-case alphabet. open-quarantine-issue.sh
+    # upper-cases REASON and the label slugger only lower-cases it back
+    # for the GitHub label, so the on-the-wire reason is always A-Z + '-'.
+    [[ "$reason" =~ ^[A-Z][A-Z0-9-]*$ ]] || return 0
+    # pkg must look like an Arch package name (defends against a
+    # future change that ever produced "[QUARANTINE][REASON] weird text").
+    [[ "$pkg" =~ ^[a-z0-9][a-z0-9._+-]{0,63}$ ]] || return 0
+    printf '%s\t%s\n' "$pkg" "$reason"
+}
+
+
+# ----------------------------------------------------------------------
 # query_aur_versions <pkg> [<pkg> ...]
 # Batched AUR RPC multiinfo query. Accepts 1..N package names on the
 # command line; batches of BATCH_SIZE go out as a single HTTP GET.

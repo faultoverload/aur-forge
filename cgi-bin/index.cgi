@@ -75,16 +75,21 @@ declare -A QUARANTINED  # name -> issue_number
 if [[ -n "${GITHUB_TOKEN:-}" && -n "${GITHUB_REPO:-}" ]]; then
     while IFS=$'\t' read -r title issue_num; do
         [[ -z "$issue_num" ]] && continue
-        # Title format: "quarantine: <pkgname> — <reason>" (see
-        # scripts/open-quarantine-issue.sh). Extract the package name.
-        pkg="${title#quarantine: }"
-        pkg="${pkg%% —*}"
-        pkg="${pkg%% -*}"
+        # Title format: "[QUARANTINE][<reason>] <pkg>" (see
+        # scripts/open-quarantine-issue.sh:59). parse_quarantine_title
+        # in lib-aur.sh extracts both the package name and the reason
+        # label as TSV. Older code parsed an obsolete "quarantine:
+        # <pkg> — <reason>" format and dropped the reason entirely —
+        # the linked table column now renders the issue link only when
+        # the title matches the real format.
+        parsed="$(parse_quarantine_title "$title")" || continue
+        [[ -n "$parsed" ]] || continue
+        pkg="${parsed%%$'\t'*}"
         if [[ -n "$pkg" ]]; then
             QUARANTINED["$pkg"]="$issue_num"
         fi
     done < <(curl -fsS \
-        -H "Authorization: token ${GITHUB_TOKEN}" \
+        -H "Authorization: token ***" \
         -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${GITHUB_REPO}/issues?state=open&labels=quarantine/blocklist-match,quarantine/pkgbuild-deps-changed,quarantine/pkgbuild-code-changed,quarantine/pkgbuild-install-added,quarantine/pkgbuild-install-edited&per_page=100" \
         2>/dev/null | jq -r '.[]? | [.title, (.number|tostring)] | @tsv' 2>/dev/null || true)

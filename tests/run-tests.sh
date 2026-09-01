@@ -359,6 +359,60 @@ else
 fi
 
 echo
+echo "=== ccache wording drift (task #3, kanban t_20581c54) ==="
+# ---------------------------------------------------------------
+# Decision: REMOVE the ccache claim from README.md and entrypoint.sh.
+# Rationale (full version in commit body): clean-chroot builds built
+# by extra-x86_64-build wipe the cache on every run, so the benefit
+# concentrates on -git packages — which aur-forge deliberately
+# avoids. Adding a real ccache wiring would require: a pacman -S
+# ccache line in the Dockerfile, a bind-mount of a host cache dir,
+# CCACHE_DIR + ccache --max-size in the chroot env, and a benchmark
+# showing non-trivial wins for the actual package set. None of that
+# exists today, so the docs were lying about a feature that does
+# not work end-to-end. This test asserts no source file claims
+# 'ccache' without an adjacent install/config line; until the
+# wiring exists, no claim is allowed.
+#
+# Scanned files: anything in the repo root + scripts/ + cgi-bin/ +
+# www/. Tests/ is intentionally excluded — the test harness itself
+# names the forbidden string in its own assertion messages, so it
+# would always flag its own existence. The harness file is part of
+# the test contract, not part of the user-facing source.
+ccache_violations=()
+ccache_scan_files=( \
+    "${REPO_ROOT}/README.md" \
+    "${REPO_ROOT}/entrypoint.sh" \
+    "${REPO_ROOT}/Dockerfile" \
+    "${REPO_ROOT}/lighttpd.conf" \
+    "${REPO_ROOT}/build.sh" \
+    "${REPO_ROOT}/init.sh" \
+    "${REPO_ROOT}/update.sh" \
+    "${REPO_ROOT}/run.sh" \
+    "${REPO_ROOT}/serve.sh" \
+    "${REPO_ROOT}/install-repo.sh" \
+    "${REPO_ROOT}/scripts"/*.sh \
+    "${REPO_ROOT}/cgi-bin"/*.cgi \
+    "${REPO_ROOT}/www"/* \
+)
+for f in "${ccache_scan_files[@]}"; do
+    [[ -f "$f" ]] || continue
+    # Strip comments before scanning so a "no ccache today" note in
+    # a code comment doesn't trigger the violation. We grep for
+    # literal 'ccache' on non-comment lines (i.e. lines whose first
+    # non-whitespace char isn't '#').
+    if grep -nE '^[[:space:]]*[^#[:space:]].*\bccache\b' "$f" >/dev/null 2>&1; then
+        ccache_violations+=("$f: $(grep -nE '^[[:space:]]*[^#[:space:]].*\bccache\b' "$f" | head -1 | sed 's/^[[:space:]]*//')")
+    fi
+done
+if [[ ${#ccache_violations[@]} -eq 0 ]]; then
+    pass "no source file claims 'ccache' without matching install/config line"
+else
+    fail "no source file claims 'ccache' without matching install/config line" \
+        "$(printf '%s\n' "${ccache_violations[@]}")"
+fi
+
+echo
 echo "=== summary ==="
 echo "passed: $PASS"
 echo "failed: $FAIL"

@@ -132,10 +132,22 @@ COPY init.sh       /usr/local/bin/init.sh
 COPY update.sh     /usr/local/bin/update.sh
 COPY serve.sh      /usr/local/bin/serve.sh
 COPY run.sh        /usr/local/bin/run.sh
+COPY install-repo.sh /usr/local/bin/install-repo.sh
 COPY scripts/      /usr/local/lib/aur-forge/
 COPY cgi-bin/      /usr/lib/aur-forge/cgi-bin/
 COPY www/          /usr/share/aur-forge/www/
 COPY lighttpd.conf /etc/aur-forge/lighttpd.conf
+
+# lighttpd.conf aliases /install-repo.sh → /usr/share/aur-forge/www/
+# install-repo.sh. The COPY www/ above only plants the contents of
+# www/ at build time (which today is install.html + style.css only).
+# Symlink install-repo.sh into www/ from /usr/local/bin/ so the alias
+# resolves to the real client-side bootstrap script. A symlink rather
+# than a COPY keeps a single source of truth — editing
+# install-repo.sh in the repo and rebuilding the image immediately
+# serves the new version with no second copy to keep in sync.
+RUN ln -sf /usr/local/bin/install-repo.sh \
+           /usr/share/aur-forge/www/install-repo.sh
 
 # CSRF secret is NOT baked into the image. It's generated on first
 # container start by init.sh and persisted to /keys/csrf-secret (a

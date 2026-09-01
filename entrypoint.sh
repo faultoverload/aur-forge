@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # aur-forge entrypoint — dispatches init|build|serve|update|drain|run|help
 # based on argv[1]. All persistent state lives in /repo (served),
-# /cache (chroots + ccache), /keys (GPG keyring), /pkglist (one package
-# per line), /approvals (PKGBUILD approval JSON, one file per package).
+# /cache (chroot roots between runs), /keys (GPG keyring), /pkglist
+# (one package per line), /approvals (PKGBUILD approval JSON, one
+# file per package).
 #
 # The 'run' mode is the long-running 24/7 service: starts darkhttpd in
 # the background and a scheduler that runs the full nightly sequence
@@ -70,7 +71,7 @@ Usage:
 
 State directories (bind-mount these from the host):
   /repo       Served output: x86_64/*.pkg.tar.zst, *.db, *.sig
-  /cache      Chroot roots + ccache between runs
+  /cache      Chroot roots retained between runs
   /keys       GPG keyring (persist; survives container rebuilds)
   /pkglist    File with one AUR package name per line
   /approvals  PKGBUILD approval JSON store (one file per package)

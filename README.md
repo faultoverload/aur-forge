@@ -251,7 +251,7 @@ Bind-mounted from the host (`/opt/docker/data/aur-forge/`):
 ```
 /opt/docker/data/aur-forge/
 ├── repo/                       served output (aur-forge.x86_64/*)
-├── cache/                      chroot roots + ccache
+├── cache/                      chroot roots retained between runs
 ├── keys/                       GPG keyring (survives container rebuilds)
 ├── approvals/                  PKGBUILD approval JSON store (one file per package)
 └── pkglist.txt                 one AUR package per line
