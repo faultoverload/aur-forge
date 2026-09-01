@@ -150,7 +150,7 @@ if [[ "$REPO_NAME" != "custom" && ! -f "$LEGACY_MARKER" \
             rm -f aur-forge.db* aur-forge.files*
             for pkg in *.pkg.tar.zst; do
                 [[ -f "$pkg" ]] || continue
-                repo-add --sign --key "$FPR" \
+                repo-add -w --prevent-downgrade --sign --key "$FPR" \
                     aur-forge.db.tar.zst "$pkg"
             done
             echo "[init] regenerated aur-forge.db with $(ls aur-forge.db* 2>/dev/null | wc -l) entries"

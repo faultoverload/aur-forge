@@ -531,10 +531,8 @@ for pkg in "${PKGS[@]}"; do
     # Drop signed packages into the served repo dir, then reindex.
     cp -f -- *.pkg.tar.zst *.pkg.tar.zst.sig "$REPO_DIR/"
     cd "$REPO_DIR"
-    repo-add --sign --key "${FPR}" \
+    repo-add -w --prevent-downgrade --sign --key "${FPR}" \
         "${REPO_NAME}.db.tar.zst" -- *.pkg.tar.zst
-    [[ -f "${REPO_NAME}.db"     ]] || cp "${REPO_NAME}.db.tar.zst" "${REPO_NAME}.db" 2>/dev/null || true
-    [[ -f "${REPO_NAME}.files"  ]] || cp "${REPO_NAME}.files.tar.zst" "${REPO_NAME}.files" 2>/dev/null || true
 
     BUILT=$((BUILT+1))
     cd / && rm -rf "$WORK"

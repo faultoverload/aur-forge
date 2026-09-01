@@ -280,6 +280,64 @@ else
 fi
 
 echo
+echo "=== repo-add safety ==="
+
+# Production callsites must use repo-add's lock wait and downgrade guard.
+if grep -E -q 'repo-add[[:space:]]+-w[[:space:]]+--prevent-downgrade[[:space:]]+--sign' \
+        "${REPO_ROOT}/build.sh"; then
+    pass "build.sh uses repo-add -w --prevent-downgrade"
+else
+    fail "build.sh must use repo-add -w --prevent-downgrade"
+fi
+if grep -E -q 'repo-add[[:space:]]+-w[[:space:]]+--prevent-downgrade[[:space:]]+--sign' \
+        "${REPO_ROOT}/init.sh"; then
+    pass "init.sh uses repo-add -w --prevent-downgrade"
+else
+    fail "init.sh must use repo-add -w --prevent-downgrade"
+fi
+
+# repo-add maintains the extensionless links itself; build.sh must not
+# retain manual fallback copies that can become stale.
+if grep -F -q 'cp "${REPO_NAME}.db.tar.zst" "${REPO_NAME}.db"' \
+        "${REPO_ROOT}/build.sh"; then
+    fail "build.sh must not manually copy the extensionless .db"
+else
+    pass "build.sh has no manual extensionless .db copy"
+fi
+if grep -F -q 'cp "${REPO_NAME}.files.tar.zst" "${REPO_NAME}.files"' \
+        "${REPO_ROOT}/build.sh"; then
+    fail "build.sh must not manually copy the extensionless .files"
+else
+    pass "build.sh has no manual extensionless .files copy"
+fi
+
+# Exercise the exact production repo-add flags against a real package
+# fixture. Use the host's Arch tools when present; otherwise use the
+# cached Arch base image when Docker is available. This remains an
+# explicit skip rather than reaching the network to pull an image.
+if command -v repo-add >/dev/null 2>&1 \
+        && command -v bsdtar >/dev/null 2>&1; then
+    if bash "${REPO_ROOT}/tests/repo-add-safety.sh" >/tmp/repo-add-safety.out 2>&1; then
+        pass "repo-add fixture validates flags, signing, links, and downgrade rejection"
+    else
+        fail "repo-add fixture failed (see /tmp/repo-add-safety.out)"
+    fi
+elif command -v docker >/dev/null 2>&1 \
+        && docker image inspect archlinux:latest >/dev/null 2>&1; then
+    if docker run --rm --platform linux/amd64 \
+            -v "${REPO_ROOT}:/workspace:ro" \
+            archlinux:latest \
+            /usr/bin/bash /workspace/tests/repo-add-safety.sh \
+            >/tmp/repo-add-safety.out 2>&1; then
+        pass "repo-add fixture validates flags, signing, links, and downgrade rejection (Arch container)"
+    else
+        fail "repo-add fixture failed in Arch container (see /tmp/repo-add-safety.out)"
+    fi
+else
+    echo "  SKIP: repo-add fixture (Arch tools and cached Arch image unavailable)"
+fi
+
+echo
 echo "=== build.sh syntax (no execution — needs arch environment) ==="
 
 # 18. All scripts pass `bash -n`.
