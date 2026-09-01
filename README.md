@@ -382,6 +382,9 @@ When the gate quarantines a malicious update:
 | `GPG_PASSPHRASE`        | (unset)                  | Passphrase for unattended GPG signing.                        |
 | `PORT`                  | `8080`                   | TCP port lighttpd listens on (internal; Traefik fronts 443).  |
 | `CSRF_SECRET_FILE`      | `/etc/aur-forge/csrf-secret` | Path to the CSRF secret. Auto-created at build time with mode 0600. Do NOT commit. |
+| `AUR_BUILD_JOBS`        | `2`                      | Compile and zstd compression job count. Bound to the same value so `MAKEFLAGS=-jN`, `NPROC=N`, and `COMPRESSZST` stay in lockstep. Validated by `scripts/makepkg-jobs-config.sh`; anything outside `[1, MAX_AUR_BUILD_JOBS]` is rejected before the first `extra-x86_64-build`. |
+| `MAX_AUR_BUILD_JOBS`     | `8`                      | Upper cap for `AUR_BUILD_JOBS`. The container's 4 GiB mem_limit and pid cap limit the safe value; raise only if you also raise `mem_limit` and confirm the cgroup survives a parallel build. |
+| `AUR_FORGE_PACMAN_CACHE_DIR` | `/cache/pacman/pkg/` | Bind-mounted persistent pacman package cache. Set by `init.sh`; ensures `arch-nspawn`'s first-cache-dir bind points at host-backed storage instead of the overlay. |
 
 ## Web UI
 

@@ -675,6 +675,352 @@ else
 fi
 
 echo
+echo "=== bounded makepkg jobs (kanban t_8f558ae3) ==="
+# ---------------------------------------------------------------
+# Phase-2 build optimization: configurable, memory-aware makepkg
+# parallelism. Container mem_limit is 4g; default AUR_BUILD_JOBS
+# stays at 2 even when the host reports more CPUs (8 vCPU / 64 GB
+# RAM per the 2026-09-01 live baseline). Compression is bounded to
+# the same job count — replaces devtools' default unbounded -T0.
+#
+# Strategy: a pure helper scripts/makepkg-jobs-config.sh that
+# exposes render_makepkg_jobs_block (text-only, exercised by tests)
+# and write_makepkg_jobs_dropin (writes a project-owned fragment).
+# init.sh sources the helper and writes the fragment at container
+# start; build.sh sets MAKEPKG_CONF to that fragment path before
+# invoking extra-x86_64-build. /etc/makepkg.conf is NEVER edited —
+# a future `pacman -Syu devtools` could rewrite it, and any drop-in
+# we plant there would be lost. Keeping the drop-in under our own
+# tree (/usr/local/lib/aur-forge/) means devtools upgrades can't
+# clobber it.
+#
+# Tests pin the contract:
+#   1. render_makepkg_jobs_block 2 emits -j2 + NPROC=2 +
+#      COMPRESSZST=(zstd -c -T2 -)
+#   2. Override (AUR_BUILD_JOBS=4) yields -j4 + NPROC=4 + -T4
+#   3. Validation rejects 0, negative, non-int, empty, junk, and
+#      any value > MAX_AUR_BUILD_JOBS (default 8)
+#   4. Default never contains -march=native / -O3 / mold / ccache /
+#      distcc / -T0 / --ultra
+#   5. README + docker-compose.sample.yml document the knob with
+#      the same default (2) the code uses
+#   6. init.sh calls write_makepkg_jobs_dropin
+#   7. build.sh calls validate_aur_build_jobs before any
+#      extra-x86_64-build invocation
+# ---------------------------------------------------------------
+MAKEPKG_JOBS_CONFIG="${SCRIPTS}/makepkg-jobs-config.sh"
+[[ -s "$MAKEPKG_JOBS_CONFIG" ]] \
+    && pass "scripts/makepkg-jobs-config.sh exists" \
+    || fail "scripts/makepkg-jobs-config.sh exists" "missing helper"
+
+# shellcheck disable=SC1090
+if [[ -s "$MAKEPKG_JOBS_CONFIG" ]]; then
+    . "$MAKEPKG_JOBS_CONFIG"
+fi
+
+if declare -F render_makepkg_jobs_block >/dev/null 2>&1; then
+    # Default jobs = 2 (matches AUR_BUILD_JOBS default in init.sh +
+    # docker-compose.sample.yml + README). All three overrides must
+    # reference the same value or makepkg will desync parallelism.
+    RENDERED_DEFAULT="$(AUR_BUILD_JOBS=2 render_makepkg_jobs_block 2>/dev/null || true)"
+    if [[ -n "$RENDERED_DEFAULT" ]]; then
+        if grep -qE '^MAKEFLAGS="-j2"' <<<"$RENDERED_DEFAULT"; then
+            pass "default render contains MAKEFLAGS=\"-j2\""
+        else
+            fail "default render contains MAKEFLAGS=\"-j2\"" \
+                "got: $(printf '%s' \"$RENDERED_DEFAULT\" | head -c 200)"
+        fi
+        if grep -qE '^NPROC=2$' <<<"$RENDERED_DEFAULT"; then
+            pass "default render contains NPROC=2"
+        else
+            fail "default render contains NPROC=2" \
+                "got: $(printf '%s' \"$RENDERED_DEFAULT\" | head -c 200)"
+        fi
+        if grep -qE '^COMPRESSZST=\(zstd -c -T2 -\)$' <<<"$RENDERED_DEFAULT"; then
+            pass "default render contains COMPRESSZST=(zstd -c -T2 -)"
+        else
+            fail "default render contains COMPRESSZST=(zstd -c -T2 -)" \
+                "got: $(printf '%s' \"$RENDERED_DEFAULT\" | head -c 200)"
+        fi
+
+        # Explicit override: AUR_BUILD_JOBS=4 → all three values must
+        # agree. If any of them drift apart, makepkg compiles with one
+        # parallelism and compresses with another — the desync is
+        # exactly the bug this knob is supposed to prevent.
+        RENDERED_4="$(AUR_BUILD_JOBS=4 render_makepkg_jobs_block 2>/dev/null || true)"
+        if [[ -n "$RENDERED_4" ]]; then
+            if grep -qE '^MAKEFLAGS="-j4"' <<<"$RENDERED_4" \
+               && grep -qE '^NPROC=4$' <<<"$RENDERED_4" \
+               && grep -qE '^COMPRESSZST=\(zstd -c -T4 -\)$' <<<"$RENDERED_4"; then
+                pass "override AUR_BUILD_JOBS=4 produces consistent -j4/NPROC=4/-T4"
+            else
+                fail "override AUR_BUILD_JOBS=4 produces consistent -j4/NPROC=4/-T4" \
+                    "got: $(printf '%s' \"$RENDERED_4\" | head -c 200)"
+            fi
+        else
+            fail "override AUR_BUILD_JOBS=4 renders" "no output"
+        fi
+
+        # Forbidden optimizations: -march=native, -mtune=native, -O3,
+        # mold, ccache, distcc. These change generated binaries or add
+        # security-irrelevant build deps that the task explicitly
+        # forbids ANYWHERE in this card.
+        for forbidden in --march=native --mtune=native mold ccache distcc icecream; do
+            if grep -qF -- "$forbidden" <<<"$RENDERED_DEFAULT"; then
+                fail "default render does not mention '$forbidden'" \
+                    "leaked into output: $(grep -F -- \"$forbidden\" <<<\"$RENDERED_DEFAULT\" | head -1)"
+            else
+                pass "default render does not mention '$forbidden'"
+            fi
+        done
+
+        # Unbounded thread count (-T0) and devtools' --ultra -20
+        # compression level defeat the bounded-jobs goal: zstd -T0
+        # = "all cores", --ultra -20 is dog-slow for marginal size
+        # gain. Lock compression threads to AUR_BUILD_JOBS and keep
+        # the default zstd level.
+        if grep -qE 'COMPRESSZST=.*-T0' <<<"$RENDERED_DEFAULT"; then
+            fail "default COMPRESSZST does not use unbounded -T0" \
+                "regression: -T0 leaked into output"
+        else
+            pass "default COMPRESSZST does not use unbounded -T0"
+        fi
+        if grep -qF -- '--ultra' <<<"$RENDERED_DEFAULT"; then
+            fail "default COMPRESSZST does not use --ultra" \
+                "regression: --ultra leaked into output"
+        else
+            pass "default COMPRESSZST does not use --ultra"
+        fi
+
+        # -O3 / -Ofast are the canonical "fast but unsafe for
+        # distribution" optimizations — makepkg defaults to -O2.
+        # Reject any -O3 or -Ofast.
+        if grep -qE '(^|[[:space:]])-O3([[:space:]]|$)' <<<"$RENDERED_DEFAULT"; then
+            fail "default render does not contain -O3" "leaked into output"
+        else
+            pass "default render does not contain -O3"
+        fi
+        if grep -qE '(^|[[:space:]])-Ofast([[:space:]]|$)' <<<"$RENDERED_DEFAULT"; then
+            fail "default render does not contain -Ofast" "leaked into output"
+        else
+            pass "default render does not contain -Ofast"
+        fi
+    else
+        fail "render_makepkg_jobs_block returns text" "no output"
+    fi
+
+    # Validation: every invalid input MUST fail before rendering. A
+    # silent pass would let "AUR_BUILD_JOBS=0" or "AUR_BUILD_JOBS=foo"
+    # explode a build under load — the whole point of the bounded
+    # knob is to keep these out of the hands of a misconfigured env.
+    # Empty string is the test for the case where the operator sets
+    # the env var to AUR_BUILD_JOBS= explicitly with no value.
+    for bad in 0 -1 "" "abc" "2.5" " 2" "2 " "2;rm -rf" "-j2" "2 jobs"; do
+        out="$(AUR_BUILD_JOBS="$bad" render_makepkg_jobs_block 2>/dev/null || true)"
+        if [[ -z "$out" ]]; then
+            pass "invalid AUR_BUILD_JOBS='${bad}' rejected (no output)"
+        else
+            fail "invalid AUR_BUILD_JOBS='${bad}' rejected" \
+                "leaked output: $(printf '%s' \"$out\" | head -c 120)"
+        fi
+    done
+
+    # Cap enforcement: the container's mem_limit is 4g; the cap
+    # default is MAX_AUR_BUILD_JOBS=8 per the task spec. Anything
+    # above that must be rejected even if the host has 32 CPUs.
+    out_too_high="$(AUR_BUILD_JOBS=9 render_makepkg_jobs_block 2>/dev/null || true)"
+    if [[ -z "$out_too_high" ]]; then
+        pass "AUR_BUILD_JOBS=9 rejected (above default MAX_AUR_BUILD_JOBS=8)"
+    else
+        fail "AUR_BUILD_JOBS=9 rejected (above default MAX_AUR_BUILD_JOBS=8)" \
+            "leaked output: $(printf '%s' \"$out_too_high\" | head -c 120)"
+    fi
+    out_boundary="$(AUR_BUILD_JOBS=8 render_makepkg_jobs_block 2>/dev/null || true)"
+    if [[ -n "$out_boundary" ]] && grep -qE '^NPROC=8$' <<<"$out_boundary"; then
+        pass "AUR_BUILD_JOBS=8 accepted (boundary)"
+    else
+        fail "AUR_BUILD_JOBS=8 accepted (boundary)" \
+            "got: $(printf '%s' \"$out_boundary\" | head -c 120)"
+    fi
+
+    # MAX_AUR_BUILD_JOBS override: operators can raise the cap by
+    # exporting the env var before invoking. The helper reads it
+    # with a default of 8 — a future tuning pass can lift the cap
+    # without editing the helper.
+    out_raised_cap="$(MAX_AUR_BUILD_JOBS=16 AUR_BUILD_JOBS=12 render_makepkg_jobs_block 2>/dev/null || true)"
+    if [[ -n "$out_raised_cap" ]] && grep -qE '^NPROC=12$' <<<"$out_raised_cap"; then
+        pass "MAX_AUR_BUILD_JOBS=16 lets AUR_BUILD_JOBS=12 through"
+    else
+        fail "MAX_AUR_BUILD_JOBS=16 lets AUR_BUILD_JOBS=12 through" \
+            "got: $(printf '%s' \"$out_raised_cap\" | head -c 120)"
+    fi
+    out_still_capped="$(MAX_AUR_BUILD_JOBS=16 AUR_BUILD_JOBS=17 render_makepkg_jobs_block 2>/dev/null || true)"
+    if [[ -z "$out_still_capped" ]]; then
+        pass "MAX_AUR_BUILD_JOBS=16 still rejects AUR_BUILD_JOBS=17"
+    else
+        fail "MAX_AUR_BUILD_JOBS=16 still rejects AUR_BUILD_JOBS=17" \
+            "leaked output"
+    fi
+
+    # validate_aur_build_jobs: standalone entry point for build.sh
+    # to fail fast BEFORE the first extra-x86_64-build invocation.
+    # It must succeed (return 0) for valid values and return
+    # non-zero for invalid ones — including printing a clear error
+    # to stderr.
+    if declare -F validate_aur_build_jobs >/dev/null 2>&1; then
+        if validate_aur_build_jobs 4 >/dev/null 2>&1; then
+            pass "validate_aur_build_jobs accepts 4"
+        else
+            fail "validate_aur_build_jobs accepts 4" "rejected a valid value"
+        fi
+        if validate_aur_build_jobs 0 >/dev/null 2>&1; then
+            fail "validate_aur_build_jobs rejects 0" "accepted an invalid value"
+        else
+            pass "validate_aur_build_jobs rejects 0"
+        fi
+        if validate_aur_build_jobs 999 >/dev/null 2>&1; then
+            fail "validate_aur_build_jobs rejects 999" "accepted an out-of-range value"
+        else
+            pass "validate_aur_build_jobs rejects 999"
+        fi
+        # Stderr message must be clear — the operator will see it
+        # in `docker logs` and in build.sh's own pre-flight output.
+        err_msg="$(validate_aur_build_jobs 0 2>&1 || true)"
+        if [[ "$err_msg" == *AUR_BUILD_JOBS* ]]; then
+            pass "validate_aur_build_jobs mentions AUR_BUILD_JOBS in error"
+        else
+            fail "validate_aur_build_jobs mentions AUR_BUILD_JOBS in error" \
+                "got: $err_msg"
+        fi
+    else
+        fail "validate_aur_build_jobs exists" "function missing"
+    fi
+else
+    fail "render_makepkg_jobs_block exists" "function missing"
+fi
+
+# bash -n on the helper.
+if bash -n "$MAKEPKG_JOBS_CONFIG" 2>/dev/null; then
+    pass "bash -n $MAKEPKG_JOBS_CONFIG"
+else
+    fail "bash -n $MAKEPKG_JOBS_CONFIG" "syntax error"
+fi
+
+# Drop-in writer: write to a project-owned path, idempotent,
+# mode 0644, contains a header comment so future readers know
+# not to hand-edit.
+if declare -F write_makepkg_jobs_dropin >/dev/null 2>&1; then
+    TMP_DROP="$(mktemp)"
+    if AUR_BUILD_JOBS=3 write_makepkg_jobs_dropin "$TMP_DROP" 2>/dev/null; then
+        if [[ -s "$TMP_DROP" ]]; then
+            pass "write_makepkg_jobs_dropin creates a non-empty file"
+        else
+            fail "write_makepkg_jobs_dropin creates a non-empty file" "empty file"
+        fi
+        mode="$(stat -c '%a' "$TMP_DROP" 2>/dev/null || stat -f '%Lp' "$TMP_DROP" 2>/dev/null || echo unknown)"
+        if [[ "$mode" == "644" ]]; then
+            pass "drop-in file is mode 0644"
+        else
+            fail "drop-in file is mode 0644" "got: $mode"
+        fi
+        if grep -qE '^MAKEFLAGS="-j3"' "$TMP_DROP" \
+           && grep -qE '^NPROC=3$' "$TMP_DROP" \
+           && grep -qE '^COMPRESSZST=\(zstd -c -T3 -\)$' "$TMP_DROP"; then
+            pass "drop-in contains consistent MAKEFLAGS/NPROC/COMPRESSZST"
+        else
+            fail "drop-in contains consistent MAKEFLAGS/NPROC/COMPRESSZST" \
+                "content: $(cat "$TMP_DROP" | head -10)"
+        fi
+        if head -1 "$TMP_DROP" | grep -qE '^#'; then
+            pass "drop-in starts with a comment header"
+        else
+            fail "drop-in starts with a comment header" \
+                "first line: $(head -1 "$TMP_DROP")"
+        fi
+    else
+        fail "write_makepkg_jobs_dropin returns 0" "non-zero exit"
+    fi
+    # Idempotency: write twice, file should be byte-identical.
+    TMP_DROP2="$(mktemp)"
+    AUR_BUILD_JOBS=3 write_makepkg_jobs_dropin "$TMP_DROP" >/dev/null 2>&1
+    AUR_BUILD_JOBS=3 write_makepkg_jobs_dropin "$TMP_DROP2" >/dev/null 2>&1
+    if diff -q "$TMP_DROP" "$TMP_DROP2" >/dev/null 2>&1; then
+        pass "write_makepkg_jobs_dropin is idempotent (identical output)"
+    else
+        fail "write_makepkg_jobs_dropin is idempotent" \
+            "diff: $(diff "$TMP_DROP" "$TMP_DROP2")"
+    fi
+    rm -f "$TMP_DROP" "$TMP_DROP2"
+else
+    fail "write_makepkg_jobs_dropin exists" "function missing"
+fi
+
+# Documentation/code alignment: README and docker-compose.sample.yml
+# must document AUR_BUILD_JOBS with the same default (2) the code
+# uses. Default cap MAX_AUR_BUILD_JOBS=8 must also be discoverable
+# in the README so operators don't have to read source.
+if grep -E '^AUR_BUILD_JOBS=' docker-compose.sample.yml >/dev/null 2>&1 \
+   || grep -E '^[[:space:]]+AUR_BUILD_JOBS:' docker-compose.sample.yml >/dev/null 2>&1; then
+    pass "docker-compose.sample.yml documents AUR_BUILD_JOBS"
+    if grep -E 'AUR_BUILD_JOBS:[[:space:]]*"?2"?[[:space:]]*$' docker-compose.sample.yml >/dev/null 2>&1 \
+       || grep -E '^AUR_BUILD_JOBS="?2"?$' docker-compose.sample.yml >/dev/null 2>&1; then
+        pass "docker-compose.sample.yml pins AUR_BUILD_JOBS default to 2"
+    else
+        fail "docker-compose.sample.yml pins AUR_BUILD_JOBS default to 2" \
+            "expected 'AUR_BUILD_JOBS: 2' (or 'AUR_BUILD_JOBS=\"2\"')"
+    fi
+else
+    fail "docker-compose.sample.yml documents AUR_BUILD_JOBS" "missing key"
+fi
+
+if grep -F 'AUR_BUILD_JOBS' README.md >/dev/null 2>&1; then
+    pass "README.md documents AUR_BUILD_JOBS"
+else
+    fail "README.md documents AUR_BUILD_JOBS" "missing key"
+fi
+
+# init.sh must call the drop-in writer (same seam pattern as the
+# pacman-cache helper tests above). The helper is pure; init.sh is
+# the integration point.
+init_text="$(cat "${REPO_ROOT}/init.sh")"
+if grep -F 'write_makepkg_jobs_dropin' <<<"$init_text" >/dev/null 2>&1; then
+    pass "init.sh calls write_makepkg_jobs_dropin"
+else
+    fail "init.sh calls write_makepkg_jobs_dropin" "no call site"
+fi
+if grep -F 'makepkg-jobs-config.sh' <<<"$init_text" >/dev/null 2>&1; then
+    pass "init.sh sources makepkg-jobs-config.sh"
+else
+    fail "init.sh sources makepkg-jobs-config.sh" "no source line"
+fi
+
+# build.sh must validate AUR_BUILD_JOBS BEFORE invoking
+# extra-x86_64-build. The fail-fast contract: if AUR_BUILD_JOBS
+# is bad, no build runs and the operator sees the error in
+# docker logs immediately.
+build_text="$(cat "${REPO_ROOT}/build.sh")"
+if grep -F 'validate_aur_build_jobs' <<<"$build_text" >/dev/null 2>&1; then
+    pass "build.sh calls validate_aur_build_jobs"
+else
+    fail "build.sh calls validate_aur_build_jobs" "no call site"
+fi
+
+# The drop-in path MUST live under /usr/local/lib/aur-forge (our
+# tree) so a future `pacman -Syu devtools` upgrade cannot clobber
+# it. Test fails fast if init.sh writes to /etc/makepkg.conf or
+# /usr/share/devtools/ — both are devtools-managed.
+for forbidden_dropin_path in '/etc/makepkg.conf' '/etc/makepkg.conf.d' \
+                             '/usr/share/devtools/makepkg.conf.d'; do
+    if grep -F "$forbidden_dropin_path" <<<"$init_text" \
+       | grep -F 'write_makepkg_jobs_dropin' >/dev/null 2>&1; then
+        fail "init.sh drop-in path is not under devtools-managed dirs ($forbidden_dropin_path)" \
+            "regression: drop-in would be clobbered by pacman -Syu devtools"
+    else
+        pass "init.sh drop-in path is not under devtools-managed dirs ($forbidden_dropin_path)"
+    fi
+done
+
+echo
 echo "=== summary ==="
 echo "passed: $PASS"
 echo "failed: $FAIL"

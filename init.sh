@@ -6,23 +6,28 @@ set -euo pipefail
 
 # Multi-candidate lib lookup (matches the pattern in update.sh).
 # init.sh is at /usr/local/bin/init.sh in production; lib-aur.sh
-# and pacman-cache-config.sh live at /usr/local/lib/aur-forge/. The
-# dev checkout puts them at scripts/, so try both.
+# and the helpers below live at /usr/local/lib/aur-forge/. The
+# dev checkout puts them at scripts/, so try both. The same
+# SCRIPT_DIR_LIB satisfies both helpers as long as the lookup
+# finds any one of the two.
 SCRIPT_DIR_LIB=""
 for cand in \
     "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts" \
     /usr/local/lib/aur-forge; do
-    if [[ -f "${cand}/pacman-cache-config.sh" ]]; then
+    if [[ -f "${cand}/pacman-cache-config.sh" ]] \
+       || [[ -f "${cand}/makepkg-jobs-config.sh" ]]; then
         SCRIPT_DIR_LIB="$cand"
         break
     fi
 done
 if [[ -z "$SCRIPT_DIR_LIB" ]]; then
-    echo "[init] WARNING: pacman-cache-config.sh not found in any candidate path" >&2
-else
-    # shellcheck disable=SC1090
-    . "${SCRIPT_DIR_LIB}/pacman-cache-config.sh"
+    echo "[init] WARNING: no helper scripts found in any candidate path" >&2
 fi
+
+# shellcheck disable=SC1090
+. "${SCRIPT_DIR_LIB}/pacman-cache-config.sh" 2>/dev/null || true
+# shellcheck disable=SC1090
+. "${SCRIPT_DIR_LIB}/makepkg-jobs-config.sh" 2>/dev/null || true
 
 REPO_NAME="${REPO_NAME:-aur-forge}"
 REPO_OWNER="${REPO_OWNER:-faultoverload}"
@@ -76,6 +81,30 @@ if [[ -n "$SCRIPT_DIR_LIB" ]] \
     echo "[init] pacman cache: ${PACMAN_CACHE_DIR} (persistent on /cache)"
 else
     echo "[init] WARNING: pacman cache drop-in helper unavailable — cache stays ephemeral" >&2
+fi
+
+# ---------------------------------------------------------------------
+# Materialize a bounded makepkg drop-in so compile and compression
+# parallelism stay inside the 4 GiB container budget.
+# ---------------------------------------------------------------------
+# The container's mem_limit is 4g; the host has 64 GiB / 8 vCPU. With
+# the devtools-shipped /etc/makepkg.conf, MAKEFLAGS/NPROC are
+# commented (=> -j1) and COMPRESSZST is unbounded `-T0` (=> all
+# cores). That desync is what blows past the 4g cgroup on the
+# compression burst. Default AUR_BUILD_JOBS=2 binds all three to
+# the same value. Validation happens in build.sh before the first
+# extra-x86_64-build call so bad env values fail fast.
+# ---------------------------------------------------------------------
+MAKEPKG_JOBS_DROPIN="${AUR_FORGE_MAKEPKG_JOBS_DROPIN:-/usr/local/lib/aur-forge/makepkg.d/00-jobs.conf}"
+if [[ -n "$SCRIPT_DIR_LIB" ]] \
+   && declare -F write_makepkg_jobs_dropin >/dev/null 2>&1; then
+    if write_makepkg_jobs_dropin "$MAKEPKG_JOBS_DROPIN"; then
+        echo "[init] makepkg jobs drop-in: ${MAKEPKG_JOBS_DROPIN} (AUR_BUILD_JOBS=${AUR_BUILD_JOBS:-default})"
+    else
+        echo "[init] WARNING: makepkg jobs drop-in not written (validation failed)" >&2
+    fi
+else
+    echo "[init] WARNING: makepkg jobs helper unavailable — staying at devtools defaults (-j1, -T0)" >&2
 fi
 
 KEY_FPR_FILE="/keys/trusted-key.fpr"

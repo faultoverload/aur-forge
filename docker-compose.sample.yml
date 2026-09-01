@@ -18,6 +18,13 @@ services:
       REPO_NAME: custom
       REPO_OWNER: faultoverload
       REPO_EMAIL: woodsyx@gmail.com
+      # AUR_BUILD_JOBS bounds compile and compression parallelism.
+      # Default 2 fits the 4g container mem_limit; raise only if the
+      # compose mem_limit is also raised. The helper
+      # scripts/makepkg-jobs-config.sh rejects anything outside the
+      # [1, MAX_AUR_BUILD_JOBS=8] range before any build starts.
+      AUR_BUILD_JOBS: "2"
+      MAX_AUR_BUILD_JOBS: "8"
     volumes:
       # Bind-mount these from the host so state survives container rebuilds.
       # /repo     served output: x86_64/*.pkg.tar.zst, *.db, *.sig

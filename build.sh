@@ -10,6 +10,40 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Multi-candidate helper lookup (matches update.sh + init.sh). The
+# makepkg jobs helper is sourced here so build.sh can validate
+# AUR_BUILD_JOBS BEFORE the first extra-x86_64-build invocation —
+# bad env values must fail fast with a clear error, not crash a
+# build mid-flight.
+HELPER_LOADED=0
+for cand in \
+    "${SCRIPT_DIR}/scripts" \
+    /usr/local/lib/aur-forge; do
+    if [[ -f "${cand}/makepkg-jobs-config.sh" ]]; then
+        # shellcheck disable=SC1090
+        . "${cand}/makepkg-jobs-config.sh"
+        HELPER_LOADED=1
+        break
+    fi
+done
+if (( HELPER_LOADED == 1 )) && declare -F validate_aur_build_jobs >/dev/null 2>&1; then
+    if ! validate_aur_build_jobs "${AUR_BUILD_JOBS-}" >/dev/null; then
+        echo "[build] AUR_BUILD_JOBS rejected before any build runs" >&2
+        exit 2
+    fi
+else
+    echo "[build] WARNING: makepkg-jobs-config.sh not found in any candidate path; continuing without AUR_BUILD_JOBS validation" >&2
+fi
+
+# Materialized drop-in from init.sh. build.sh sets MAKEPKG_CONF to
+# this path so makepkg sources OUR bounded config instead of the
+# devtools-shipped one. Path is fixed at the production location;
+# init.sh is responsible for writing it.
+MAKEPKG_JOBS_DROPIN="/usr/local/lib/aur-forge/makepkg.d/00-jobs.conf"
+if [[ -f "${MAKEPKG_JOBS_DROPIN}" ]]; then
+    export MAKEPKG_CONF="${MAKEPKG_JOBS_DROPIN}"
+fi
 # shellcheck source=scripts/approval-store.sh
 source "${SCRIPT_DIR}/approval-store.sh"
 # shellcheck source=scripts/srcinfo-diff.sh
