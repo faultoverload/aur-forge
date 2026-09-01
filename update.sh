@@ -40,9 +40,30 @@ fi
 
 # Source shared helpers. lib-aur.sh defaults REPO_NAME, PKGLIST, REPO_DIR
 # from env vars; we keep our local copies aligned.
-LIB_AUR_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/scripts" && pwd)/lib-aur.sh"
+#
+# IMPORTANT: in the container, update.sh lives at /usr/local/bin/update.sh
+# and lib-aur.sh lives at /usr/local/lib/aur-forge/lib-aur.sh. There is
+# NO /usr/local/bin/scripts/ directory — the Dockerfile's `COPY scripts/
+# /usr/local/lib/aur-forge/` flattens scripts/ contents directly into
+# /usr/local/lib/aur-forge/. The earlier $(dirname "${BASH_SOURCE[0]}")/scripts
+# form looked for /usr/local/bin/scripts/lib-aur.sh and `cd` failed with
+# "No such file or directory" before lib-aur.sh could ever be sourced.
+# Use the same multi-candidate lookup that the CGI scripts use, so the
+# logic works whether update.sh is invoked from /usr/local/bin/, from
+# the repo root in dev, or anywhere else.
+LIB_AUR=""
+for candidate in \
+    /usr/local/lib/aur-forge/lib-aur.sh \
+    /usr/lib/aur-forge/lib-aur.sh \
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" 2>/dev/null && pwd)/lib-aur.sh"; do
+    [[ -f "$candidate" ]] && LIB_AUR="$candidate" && break
+done
+if [[ -z "$LIB_AUR" ]]; then
+    echo "[update] lib-aur.sh not found (searched: /usr/local/lib/aur-forge/, /usr/lib/aur-forge/, <update.sh-dir>/../scripts/)" >&2
+    exit 1
+fi
 # shellcheck disable=SC1090
-. "$LIB_AUR_PATH"
+. "$LIB_AUR"
 
 # Read pkglist into PKGS array (space-separated string for lib-aur.sh
 # backwards-compat; we use it as both an array here and pass via env).

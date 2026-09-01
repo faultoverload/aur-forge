@@ -46,7 +46,10 @@ fi
 # SIGTERM to the CGI doesn't kill the build. Output is captured to the
 # container's stdout/stderr (which systemd or docker logs will pick up).
 LOG_TAG="[aur-forge-check $(date -u +%FT%TZ)]"
-setsid nohup /usr/local/bin/bash -c "echo '${LOG_TAG} starting update.sh'; /usr/local/bin/update.sh" \
+# IMPORTANT: invoke bash by its real path. The Arch base image ships bash
+# at /usr/bin/bash; there is NO bash at /usr/local/bin/bash. Calling the
+# wrong path produces a silent nohup error and the build never runs.
+setsid nohup /usr/bin/bash -c "echo '${LOG_TAG} starting update.sh'; /usr/local/bin/update.sh" \
     >/var/log/aur-forge-check.log 2>&1 < /dev/null &
 spawn_pid=$!
 

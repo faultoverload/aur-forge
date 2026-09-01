@@ -454,6 +454,54 @@ fi
 
 # ---------------------------------------------------------------
 echo
+echo "=== check.cgi: bash path regression (must NOT use /usr/local/bin/bash) ==="
+# ---------------------------------------------------------------
+# Regression: 2026-09-01 the web UI's "Check / build" button appeared
+# to queue the build but no update.sh ever started. Root cause: the
+# CGI spawned '/usr/local/bin/bash' as the interpreter for the nohup'd
+# command — but the Arch base image ships bash at /usr/bin/bash, so
+# nohup emitted a "failed to run command" error that was silently
+# swallowed (CGI returned its "queued" HTML before nohup's stderr was
+# captured). The fix: invoke /usr/bin/bash directly.
+if grep -E '^[^#]*\busr/local/bin/bash\b' "${CGI}/check.cgi" >/dev/null; then
+    fail "check.cgi must not invoke /usr/local/bin/bash" "found reference in source"
+else
+    pass "check.cgi does not invoke /usr/local/bin/bash"
+fi
+if grep -q '/usr/bin/bash' "${CGI}/check.cgi"; then
+    pass "check.cgi invokes /usr/bin/bash"
+else
+    fail "check.cgi invokes /usr/bin/bash" "expected /usr/bin/bash invocation"
+fi
+
+# ---------------------------------------------------------------
+echo
+echo "=== update.sh: lib-aur.sh resolution regression (must use multi-candidate lookup) ==="
+# ---------------------------------------------------------------
+# Regression: 2026-09-01 update.sh tried to source lib-aur.sh via
+# $(dirname "${BASH_SOURCE[0]}")/scripts/lib-aur.sh — but in the
+# production image update.sh is at /usr/local/bin/update.sh and
+# lib-aur.sh is at /usr/local/lib/aur-forge/lib-aur.sh (the Dockerfile
+# flattens scripts/ contents into /usr/local/lib/aur-forge/). The
+# 'scripts/' subdirectory under /usr/local/bin/ does not exist, so
+# `cd "$SCRIPT_DIR/scripts"` failed with "No such file or directory"
+# and update.sh exited before doing any work.
+# Verify the production-style lookup pattern works.
+# We can also assert structurally that update.sh no longer uses the
+# broken SCRIPT_DIR/scripts path.
+if grep -E 'cd.*\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)/scripts.*&& pwd.*lib-aur\.sh' "${REPO_ROOT}/update.sh" >/dev/null; then
+    fail "update.sh does not use the broken 'cd .../scripts' lookup" "still references /scripts/ subdir"
+else
+    pass "update.sh no longer uses the broken 'cd .../scripts' lookup"
+fi
+if grep -q '/usr/local/lib/aur-forge/lib-aur.sh' "${REPO_ROOT}/update.sh"; then
+    pass "update.sh uses the production /usr/local/lib/aur-forge/lib-aur.sh path"
+else
+    fail "update.sh uses the production /usr/local/lib/aur-forge/lib-aur.sh path" "missing canonical path candidate"
+fi
+
+# ---------------------------------------------------------------
+echo
 echo "=== regression: existing test suite ==="
 # ---------------------------------------------------------------
 if bash "${REPO_ROOT}/tests/run-tests.sh" >/tmp/regression.out 2>&1; then
