@@ -413,6 +413,268 @@ else
 fi
 
 echo
+echo "=== devtools pacman cache persistence (kanban t_f3555395) ==="
+# ---------------------------------------------------------------
+# Phase-1 cache persistence: the live baseline (2026-09-01) shows
+# pacman-conf resolves CacheDir=/var/cache/pacman/pkg/ (overlay,
+# in-container), so every pacman download is lost on container
+# recreation. The fix is to prepend a CacheDir line under the
+# bind-mounted /cache path so arch-nspawn's first-cache-dir bind
+# (line 99 of devtools' arch-nspawn.in) points at host-backed
+# storage.
+#
+# Strategy: ship a pure helper (scripts/pacman-cache-config.sh)
+# that takes the upstream config text and a cache path and emits
+# the modified config. init.sh applies the result to
+# /usr/share/devtools/pacman.conf.d/extra.conf at startup.
+#
+# These tests pin the contract:
+#   1. First CacheDir in the rendered config is the supplied path.
+#   2. SigLevel = Required DatabaseOptional is preserved verbatim
+#      (we never weaken the trust floor).
+#   3. Any CacheServer directive (if present) is preserved.
+#   4. Idempotency: re-rendering produces byte-identical output.
+#   5. /cache/pacman/pkg creation in Dockerfile uses the expected
+#      owner/mode (builder:builder 0755 — the makechrootpkg
+#      process drops to `builder` for the actual build).
+#   6. docker-compose.sample.yml documents /cache/pacman/pkg.
+#   7. README.md documents /cache/pacman/pkg with the same
+#      spelling as the code.
+#   8. scripts/pacman-cache-config.sh bash -n passes.
+# ---------------------------------------------------------------
+
+# Source the helper as a library — same pattern as
+# scripts/approval-store.sh and scripts/lib-aur.sh.
+PACMAN_CACHE_CONFIG="${SCRIPTS}/pacman-cache-config.sh"
+[[ -s "$PACMAN_CACHE_CONFIG" ]] \
+    && pass "scripts/pacman-cache-config.sh exists" \
+    || fail "scripts/pacman-cache-config.sh exists" "missing helper"
+
+# shellcheck disable=SC1090
+if [[ -s "$PACMAN_CACHE_CONFIG" ]]; then
+    . "$PACMAN_CACHE_CONFIG"
+fi
+
+# Synthetic upstream pacman.conf (matches the devtools-1.5.1 shape
+# observed in the live baseline). Includes the trailing #CacheDir
+# comment (default-fallback), SigLevel, [core]/[extra] stanzas.
+UPSTREAM_PACMAN_CONF='[options]
+HoldPkg     = pacman glibc
+CleanMethod = KeepInstalled
+Architecture = auto
+SigLevel    = Required DatabaseOptional
+LocalFileSigLevel = Optional
+NoProgressBar
+ParallelDownloads = 5
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist
+'
+
+# Minimal but realistic CacheServer-bearing variant: project memory
+# flagged that some pacman configs historically tried CacheServer
+# (it's not a real directive, but defensive preservation is the
+# correct behavior for any custom value a future user adds).
+UPSTREAM_WITH_CACHESERVER='[options]
+HoldPkg     = pacman glibc
+SigLevel    = Required DatabaseOptional
+CacheServer = https://cache.example.invalid
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+'
+
+RENDERED=""
+if declare -F render_pacman_cache_conf >/dev/null 2>&1; then
+    RENDERED="$(render_pacman_cache_conf "$UPSTREAM_PACMAN_CONF" "/cache/pacman/pkg/")"
+fi
+
+if [[ -n "$RENDERED" ]]; then
+    # 1. First CacheDir line is /cache/pacman/pkg/.
+    first_cache_dir="$(printf '%s\n' "$RENDERED" \
+        | grep -E '^[[:space:]]*CacheDir[[:space:]]*=' \
+        | head -1 \
+        | sed -E 's/^[[:space:]]*CacheDir[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/')"
+    assert_eq "$first_cache_dir" "/cache/pacman/pkg/" \
+        "first CacheDir in rendered config is /cache/pacman/pkg/"
+
+    # 2. SigLevel preserved verbatim — Required DatabaseOptional.
+    if printf '%s\n' "$RENDERED" | grep -E '^[[:space:]]*SigLevel[[:space:]]*=[[:space:]]*Required[[:space:]]+DatabaseOptional' >/dev/null; then
+        pass "SigLevel = Required DatabaseOptional preserved"
+    else
+        fail "SigLevel = Required DatabaseOptional preserved" \
+            "got: $(printf '%s\n' "$RENDERED" | grep -E '^[[:space:]]*SigLevel' || echo '<none>')"
+    fi
+
+    # 3. Idempotency: re-render with the same inputs, expect
+    # byte-identical output. This is a property the helper MUST
+    # satisfy so init.sh can re-run on every container start
+    # without churn.
+    RENDERED_AGAIN="$(render_pacman_cache_conf "$UPSTREAM_PACMAN_CONF" "/cache/pacman/pkg/")"
+    assert_eq "$RENDERED_AGAIN" "$RENDERED" \
+        "render_pacman_cache_conf is idempotent"
+
+    # 3b. If the upstream config contains a CacheServer directive
+    # (defensive: not a real pacman key, but preserve any value
+    # the user might have added for a future pacman version).
+    RENDERED_CS="$(render_pacman_cache_conf "$UPSTREAM_WITH_CACHESERVER" "/cache/pacman/pkg/")"
+    if printf '%s\n' "$RENDERED_CS" | grep -E '^[[:space:]]*CacheServer[[:space:]]*=' >/dev/null; then
+        pass "CacheServer directive preserved (defensive)"
+    else
+        fail "CacheServer directive preserved (defensive)" \
+            "lost CacheServer during render"
+    fi
+
+    # 4. CacheDir count: at least one (the new one) and the new
+    # one is under /cache. The old /var/cache/pacman/pkg/ may or
+    # may not survive — implementation choice, but the FIRST one
+    # must be /cache/pacman/pkg/.
+    cache_dir_count="$(printf '%s\n' "$RENDERED" \
+        | grep -cE '^[[:space:]]*CacheDir[[:space:]]*=')"
+    if (( cache_dir_count >= 1 )); then
+        pass "rendered config has at least one CacheDir line (count=$cache_dir_count)"
+    else
+        fail "rendered config has at least one CacheDir line" \
+            "got count=$cache_dir_count"
+    fi
+
+    # 5. The /cache cache path is the FIRST occurrence (so
+    # arch-nspawn binds it RW on top of the chroot's path).
+    first_dir_line_num="$(printf '%s\n' "$RENDERED" \
+        | grep -nE '^[[:space:]]*CacheDir[[:space:]]*=' \
+        | head -1 \
+        | cut -d: -f1)"
+    first_dir_value="$(printf '%s\n' "$RENDERED" \
+        | sed -n "${first_dir_line_num}p" \
+        | sed -E 's/^[[:space:]]*CacheDir[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/')"
+    case "$first_dir_value" in
+        /cache/*) pass "first CacheDir resolves under /cache (line $first_dir_line_num: $first_dir_value)" ;;
+        *)        fail "first CacheDir resolves under /cache" \
+                       "got '$first_dir_value' on line $first_dir_line_num" ;;
+    esac
+else
+    # Render failed or function missing — record the chain so we
+    # can fix it after the first commit.
+    fail "render_pacman_cache_conf exists and returns text" "no output (function missing or empty)"
+    fail "first CacheDir in rendered config is /cache/pacman/pkg/" "skipped — no rendered output"
+    fail "SigLevel = Required DatabaseOptional preserved" "skipped — no rendered output"
+    fail "render_pacman_cache_conf is idempotent" "skipped — no rendered output"
+    fail "CacheServer directive preserved (defensive)" "skipped — no rendered output"
+    fail "rendered config has at least one CacheDir line" "skipped — no rendered output"
+    fail "first CacheDir resolves under /cache" "skipped — no rendered output"
+fi
+
+# 6. bash -n on the helper.
+if bash -n "$PACMAN_CACHE_CONFIG" 2>/dev/null; then
+    pass "bash -n $PACMAN_CACHE_CONFIG"
+else
+    fail "bash -n $PACMAN_CACHE_CONFIG" "syntax error"
+fi
+
+# 7. docker-compose.sample.yml documents /cache/pacman/pkg.
+if grep -F '/cache/pacman/pkg' "${REPO_ROOT}/docker-compose.sample.yml" >/dev/null 2>&1; then
+    pass "docker-compose.sample.yml documents /cache/pacman/pkg"
+else
+    fail "docker-compose.sample.yml documents /cache/pacman/pkg" \
+        "missing path string"
+fi
+
+# 8. README.md documents /cache/pacman/pkg.
+if grep -F '/cache/pacman/pkg' "${REPO_ROOT}/README.md" >/dev/null 2>&1; then
+    pass "README.md documents /cache/pacman/pkg"
+else
+    fail "README.md documents /cache/pacman/pkg" \
+        "missing path string"
+fi
+
+# 9. README.md distinguishes the three cache paths by name:
+# AUR source/work cache, official Arch package cache, clean
+# chroot state. Each must be in its own line/section so a
+# reader can tell them apart.
+if grep -F '/cache/work' "${REPO_ROOT}/README.md" >/dev/null 2>&1 \
+   && grep -F '/cache/pacman/pkg' "${REPO_ROOT}/README.md" >/dev/null 2>&1 \
+   && grep -F '/var/lib/archbuild' "${REPO_ROOT}/README.md" >/dev/null 2>&1; then
+    pass "README.md mentions all three cache paths distinctly (/cache/work, /cache/pacman/pkg, /var/lib/archbuild)"
+else
+    fail "README.md mentions all three cache paths distinctly" \
+        "expected /cache/work + /cache/pacman/pkg + /var/lib/archbuild"
+fi
+
+# 10. Dockerfile plants /cache/pacman/pkg at image build time
+# with the expected owner/mode. Both the directory creation AND
+# the chown must be present — pacstrap runs as root during
+# chroot bootstrap, but makechrootpkg drops to `builder` for
+# the actual build, so the dir must be writable by both.
+dockerfile_text="$(cat "${REPO_ROOT}/Dockerfile")"
+if grep -F '/cache/pacman/pkg' <<<"$dockerfile_text" >/dev/null 2>&1; then
+    pass "Dockerfile creates /cache/pacman/pkg"
+else
+    fail "Dockerfile creates /cache/pacman/pkg" \
+        "no mkdir/mkdir -p for /cache/pacman/pkg"
+fi
+if grep -E 'chown[[:space:]]+builder:builder[[:space:]]+.*/cache' <<<"$dockerfile_text" >/dev/null 2>&1 \
+   && grep -E 'chown[[:space:]]+builder:builder[[:space:]]+.*(/cache|/cache/pacman/pkg)' <<<"$dockerfile_text" >/dev/null 2>&1; then
+    pass "Dockerfile chowns /cache tree to builder:builder"
+else
+    fail "Dockerfile chowns /cache tree to builder:builder" \
+        "expected 'chown builder:builder /cache[/pacman/pkg]'"
+fi
+# 0755 is the narrowest correct mode: writable by owner
+# (builder), readable+executable by group/other. Defends
+# against a future chmod 777 copy-paste regression.
+if grep -E 'chmod[[:space:]]+0755[[:space:]]+.*(/cache|/cache/pacman/pkg)' <<<"$dockerfile_text" >/dev/null 2>&1; then
+    pass "Dockerfile sets /cache mode to 0755"
+else
+    fail "Dockerfile sets /cache mode to 0755" \
+        "expected 'chmod 0755 /cache' or 'chmod 0755 /cache/pacman/pkg'"
+fi
+# Belt-and-braces: the helper scripts must NOT do a chmod 0777.
+# 0777/0775 world-writable modes on a pacman package cache
+# would be a clear regression we want the test to catch. Note
+# the regex is `0?777` or `0?775` — NOT `0?7[75][57]`, which
+# would falsely flag the correct `chmod 0755` mode.
+if grep -E '\bchmod[[:space:]]+0?77[57][[:space:]]+.*(/cache|/cache/pacman/pkg)' \
+        <<<"$dockerfile_text" >/dev/null 2>&1; then
+    fail "Dockerfile must not chmod 0777/0775 /cache" \
+        "regression: world-writable cache dir"
+fi
+
+# 11. init.sh installs the rendered config into the devtools
+# pacman.conf via an Include directive (idempotent). The
+# Include path must point at a file we control under
+# /usr/local/lib/aur-forge (so pacman -Syu devtools can't
+# clobber it). The literal `Include = ...` text only exists
+# at runtime inside the devtools extra.conf (not in init.sh
+# source), so we assert the runtime contract instead: init.sh
+# must call install_pacman_cache_include on the canonical
+# extra.conf path.
+init_text="$(cat "${REPO_ROOT}/init.sh")"
+if grep -F 'install_pacman_cache_include' <<<"$init_text" >/dev/null 2>&1; then
+    pass "init.sh calls install_pacman_cache_include"
+else
+    fail "init.sh calls install_pacman_cache_include" \
+        "no call site for the include installer"
+fi
+if grep -F 'pacman.conf.d/extra.conf' <<<"$init_text" >/dev/null 2>&1; then
+    pass "init.sh references the devtools extra.conf"
+else
+    fail "init.sh references the devtools extra.conf" \
+        "missing reference to extra.conf"
+fi
+# /usr/local/lib/aur-forge/pacman.d/ — the path the drop-in is
+# planted under. Must be under our tree (not under /usr/share,
+# which is devtools-managed and could be clobbered by upgrades).
+if grep -F '/usr/local/lib/aur-forge/pacman.d' <<<"$init_text" >/dev/null 2>&1; then
+    pass "init.sh plants drop-in under /usr/local/lib/aur-forge/pacman.d/"
+else
+    fail "init.sh plants drop-in under /usr/local/lib/aur-forge/pacman.d/" \
+        "missing drop-in path"
+fi
+
+echo
 echo "=== summary ==="
 echo "passed: $PASS"
 echo "failed: $FAIL"

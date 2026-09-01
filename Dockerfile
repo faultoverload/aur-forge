@@ -126,6 +126,32 @@ RUN useradd -m -s /bin/bash builder \
 # needed.
 WORKDIR /repo
 
+# ---------------------------------------------------------------------
+# Plant /cache/pacman/pkg at image build time.
+# ---------------------------------------------------------------------
+# devtools' `extra-x86_64-build` -> `arch-nspawn` resolves the host's
+# pacman `CacheDir` and bind-mounts the FIRST entry as RW into the
+# build chroot (devtools' arch-nspawn.in line 99). If we leave the
+# default `CacheDir = /var/cache/pacman/pkg/`, every pacman download
+# is written into the container's overlay and lost on container
+# recreation. The fix is to make the FIRST CacheDir under /cache
+# (which is host-bind-mounted at runtime) and ensure the directory
+# exists with the right ownership and mode. See
+# scripts/pacman-cache-config.sh + init.sh for the runtime half —
+# here we just pre-create the path so `pacman -Sy` during the
+# archlinux:latest keying step (line 109 below) has a CacheDir to
+# write into, AND so the overlay layer has the directory shape
+# we expect before the host bind-mount replaces it.
+#
+# Mode 0755 (not 0777): narrowest mode that lets both root
+# (initial pacstrap during extra-x86_64-build) and `builder`
+# (the makepkg process inside the chroot) write here. Owner
+# builder:builder matches build.sh:59's existing /cache chown.
+# ---------------------------------------------------------------------
+RUN mkdir -p /cache/pacman/pkg \
+ && chmod 0755 /cache /cache/pacman/pkg \
+ && chown builder:builder /cache /cache/pacman/pkg
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY build.sh      /usr/local/bin/build.sh
 COPY init.sh       /usr/local/bin/init.sh

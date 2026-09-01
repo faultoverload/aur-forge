@@ -251,11 +251,46 @@ Bind-mounted from the host (`/opt/docker/data/aur-forge/`):
 ```
 /opt/docker/data/aur-forge/
 ├── repo/                       served output (aur-forge.x86_64/*)
-├── cache/                      chroot roots retained between runs
+├── cache/                      host-backed cache volume (single bind mount);
+│                               contains three distinct subtrees that must
+│                               not be confused:
+│   ├── cache/work/             AUR source/work cache (makepkg SRCDEST);
+│   │                           cloned PKGBUILDs land here pre-build.
+│   ├── cache/work-quarantine/  cloned trees the security gate denied;
+│   │                           one timestamped dir per quarantined package.
+│   └── cache/pacman/pkg/       official Arch package cache (pacman's
+│                               CacheDir); persists across container
+│                               rebuilds so incremental rebuilds don't
+│                               re-download every dep. Patched into the
+│                               devtools pacman.conf via a drop-in
+│                               (scripts/pacman-cache-config.sh) so it
+│                               becomes the FIRST CacheDir and the one
+│                               devtools' arch-nspawn bind-mounts RW into
+│                               the build chroot.
 ├── keys/                       GPG keyring (survives container rebuilds)
 ├── approvals/                  PKGBUILD approval JSON store (one file per package)
 └── pkglist.txt                 one AUR package per line
 ```
+
+The clean build chroot itself lives **in-container** at
+`/var/lib/archbuild/extra-x86_64/` — not bind-mounted, not persisted.
+Each `extra-x86_64-build -c` invocation wipes and re-bootstraps it via
+pacstrap (see init.sh). That is intentional: a fresh chroot per build
+is what makes the build hermetic.
+
+### Why three caches, not one
+
+They look similar (all under `/cache` or its neighbours) but they
+serve different lifetimes and consumers — getting this wrong means
+either re-downloading every dep on every rebuild, or keeping build
+artifacts alive between unrelated builds:
+
+| Path (in-container)              | Backing                  | Lifetime            | Purpose                                                              |
+| -------------------------------- | ------------------------ | ------------------- | -------------------------------------------------------------------- |
+| `/cache/work/`                   | bind-mount from host     | survives rebuilds   | AUR source tarballs (makepkg `SRCDEST`) — re-cloned PKGBUILDs land here |
+| `/cache/work-quarantine/`        | bind-mount from host     | survives rebuilds   | Quarantined cloned trees (security gate deny) — one dir per package  |
+| `/cache/pacman/pkg/`             | bind-mount from host     | survives rebuilds   | Official Arch package cache (pacman `CacheDir`) — incremental rebuilds reuse downloads |
+| `/var/lib/archbuild/extra-x86_64/` | container overlay       | rebuilt per build   | Clean chroot root — wiped by `extra-x86_64-build -c`                 |
 
 ## Adding or updating packages
 

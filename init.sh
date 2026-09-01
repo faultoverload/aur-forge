@@ -4,6 +4,26 @@
 # on an existing keyring is a no-op.
 set -euo pipefail
 
+# Multi-candidate lib lookup (matches the pattern in update.sh).
+# init.sh is at /usr/local/bin/init.sh in production; lib-aur.sh
+# and pacman-cache-config.sh live at /usr/local/lib/aur-forge/. The
+# dev checkout puts them at scripts/, so try both.
+SCRIPT_DIR_LIB=""
+for cand in \
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts" \
+    /usr/local/lib/aur-forge; do
+    if [[ -f "${cand}/pacman-cache-config.sh" ]]; then
+        SCRIPT_DIR_LIB="$cand"
+        break
+    fi
+done
+if [[ -z "$SCRIPT_DIR_LIB" ]]; then
+    echo "[init] WARNING: pacman-cache-config.sh not found in any candidate path" >&2
+else
+    # shellcheck disable=SC1090
+    . "${SCRIPT_DIR_LIB}/pacman-cache-config.sh"
+fi
+
 REPO_NAME="${REPO_NAME:-aur-forge}"
 REPO_OWNER="${REPO_OWNER:-faultoverload}"
 REPO_EMAIL="${REPO_EMAIL:-woodsyx@gmail.com}"
@@ -13,6 +33,50 @@ GPG_PASSPHRASE="${GPG_PASSPHRASE:-}"   # empty = unprotected key (homelab OK)
 export GNUPGHOME="/keys"
 mkdir -p /keys /repo /cache
 chmod 700 /keys
+
+# ---------------------------------------------------------------------
+# Make the pacman package cache persistent across container rebuilds.
+# ---------------------------------------------------------------------
+# The live baseline (2026-09-01) showed pacman-conf resolves
+# `CacheDir = /var/cache/pacman/pkg/` against the devtools-shipped
+# /usr/share/devtools/pacman.conf.d/extra.conf. That directory is
+# overlay (in-container), so every pacman download is lost on
+# container recreation. Fix: prepend `CacheDir = /cache/pacman/pkg/`
+# to the devtools config so arch-nspawn's first-cache-dir bind
+# (line 99 of devtools' arch-nspawn.in) points at host-backed
+# storage on the bind-mounted /cache volume.
+#
+# We install a tiny drop-in fragment under our own tree
+# (/usr/local/lib/aur-forge/pacman.d/) and add a single `Include`
+# line to extra.conf. That keeps our cache config isolated from
+# any future `pacman -Syu devtools` upgrade — the devtools
+# package will rewrite its extra.conf, but the Include we add is
+# idempotent and we re-install it on every container start.
+# ---------------------------------------------------------------------
+PACMAN_CACHE_DIR="${AUR_FORGE_PACMAN_CACHE_DIR:-/cache/pacman/pkg/}"
+PACMAN_DROPIN="${AUR_FORGE_PACMAN_DROPIN:-/usr/local/lib/aur-forge/pacman.d/00-cache.conf}"
+PACMAN_EXTRA_CONF="${AUR_FORGE_PACMAN_EXTRA_CONF:-/usr/share/devtools/pacman.conf.d/extra.conf}"
+
+mkdir -p "$PACMAN_CACHE_DIR"
+# 0755: writable by owner (builder, who runs makechrootpkg), r-x
+# for group/other. NO 0777 — that would be a clear regression;
+# 0755 is the narrowest mode that lets both root (initial pacstrap)
+# and `builder` (subsequent makechrootpkg) write into the dir.
+chmod 0755 "$PACMAN_CACHE_DIR"
+# Both root (initial chroot bootstrap) and the `builder` user
+# (who runs makepkg + extra-x86_64-build) need to write here.
+# root: rwx; builder: rwx; others: r-x. chown is idempotent.
+chown builder:builder "$PACMAN_CACHE_DIR" 2>/dev/null || true
+
+if [[ -n "$SCRIPT_DIR_LIB" ]] \
+   && declare -F write_pacman_cache_dropin >/dev/null 2>&1 \
+   && declare -F install_pacman_cache_include >/dev/null 2>&1; then
+    write_pacman_cache_dropin "$PACMAN_DROPIN" "$PACMAN_CACHE_DIR"
+    install_pacman_cache_include "$PACMAN_EXTRA_CONF" "$PACMAN_DROPIN"
+    echo "[init] pacman cache: ${PACMAN_CACHE_DIR} (persistent on /cache)"
+else
+    echo "[init] WARNING: pacman cache drop-in helper unavailable — cache stays ephemeral" >&2
+fi
 
 KEY_FPR_FILE="/keys/trusted-key.fpr"
 

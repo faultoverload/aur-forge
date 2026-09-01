@@ -20,6 +20,15 @@ services:
       REPO_EMAIL: woodsyx@gmail.com
     volumes:
       # Bind-mount these from the host so state survives container rebuilds.
+      # /repo     served output: x86_64/*.pkg.tar.zst, *.db, *.sig
+      # /cache    three distinct subtrees under it:
+      #             /cache/work              AUR source tarballs (makepkg SRCDEST)
+      #             /cache/work-quarantine   quarantined cloned trees (gate deny)
+      #             /cache/pacman/pkg        official Arch package cache (pacman
+      #                                      CacheDir; persists across builds)
+      #           The clean chroot itself lives at /var/lib/archbuild
+      #           (in-container; rebuilt every `extra-x86_64-build -c`).
+      # /keys     GPG keyring (survives container rebuilds)
       - ./pkglist.txt:/pkglist:ro
       - aur-forge-repo:/repo
       - aur-forge-cache:/cache
