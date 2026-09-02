@@ -78,16 +78,18 @@ RUN useradd -m -s /bin/bash tmpbuild \
         cd /tmp && \
         git clone --depth 1 https://github.com/musqz/archcanary.git && \
         cd archcanary/packaging && \
-        makepkg -si --noconfirm --skippgpcheck && \
-        cd /tmp && \
-        AURUTILS_PIN_FILE=/usr/local/lib/aur-forge/aurutils.version \
-            AUR_BUILD_INSTALL_AURUTILS=1 \
-            bash /usr/local/lib/aur-forge/install-aurutils.sh' \
+        makepkg -si --noconfirm --skippgpcheck' \
+    && AURUTILS_PIN_FILE=/usr/local/lib/aur-forge/aurutils.version \
+       AUR_BUILD_INSTALL_AURUTILS=1 \
+       bash /usr/local/lib/aur-forge/install-aurutils.sh \
     && rm -rf /tmp/archcanary /tmp/aurutils-* /usr/local/lib/aur-forge/aurutils-*tar.gz \
     && userdel -r tmpbuild 2>/dev/null || true \
     && rm -f /etc/sudoers.d/tmpbuild \
     && archcanary --help >/dev/null || { echo "archcanary install failed"; exit 1; } \
-    && command -v aur >/dev/null || { echo "aurutils install failed"; exit 1; }
+    && test -x /usr/local/lib/aur-forge/aurutils/aur \
+    && test -x /usr/local/lib/aur-forge/aurutils/lib/aur-fetch \
+    && test -x /usr/local/lib/aur-forge/aurutils/lib/aur-vercmp \
+    || { echo "pinned aurutils install failed"; exit 1; }
 
 # Make pacman + makepkg happy in a containerized chroot. makepkg runs
 # extra-x86_64-build which creates its own chroot via pacstrap — no

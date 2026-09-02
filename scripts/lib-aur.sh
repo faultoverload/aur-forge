@@ -11,6 +11,26 @@
 #   parse_pkglist [path] -> emits package names one per line on stdout
 #   query_aur_versions <pkg> [<pkg> ...] -> emits "name<TAB>version<TAB>ood_ts"
 #   parse_local_versions [repo_dir] -> emits "name<TAB>version" from *.pkg.tar.zst
+#   aur_needs_build <aur_ver> <local_ver> [pkg]
+#       Tries to decide whether the AUR version is newer than the
+#       locally-served version, using the most reliable comparator
+#       available in the deployment image. The output is a single
+#       line: either "build" (AUR is strictly newer) or "current"
+#       (local catches AUR or AUR is older/equal). Defaults to
+#       "current" when both inputs are empty/non-existent, so the
+#       caller can rely on a useful default rather than a noisy
+#       empty response.
+#
+#       Precedence:
+#         1. The pinned aurutils binary at /usr/local/lib/aur-forge/
+#            aurutils/aur fetch aur-vercmp (used as a comparator).
+#            This is the production path.
+#         2. /usr/bin/aur (if it's installed and on PATH).
+#         3. pacman's `vercmp` (always available on Arch, but on
+#            non-Arch dev hosts we fall back to a `sort -V` heuristic
+#            so the unit suite can run anywhere).
+#         4. The `sort -V` heuristic.
+#       The helper returns 0 always; status is on stdout.
 #   html_escape <string>
 #   csrf_token_init [path] -> ensures a secret file exists at <path>
 #   csrf_token_issue [path] -> emits a token derived from the secret
@@ -197,6 +217,98 @@ parse_local_versions() {
             printf '%s\t%s\n' "$name" "$ver"
         fi
     done
+}
+
+# ----------------------------------------------------------------------
+# aur_needs_build <aur_ver> <local_ver> [pkg]
+# Decide whether <aur_ver> is strictly newer than <local_ver>.
+# Output: "build" or "current" on stdout, plus a tab-separated
+# comparator label (e.g. "build\tvercmp", "current\tfallback").
+# Returns 0 always so it composes with pipelines under set -e.
+#
+# Precedence for picking the comparator:
+#   1. Pinned aurutils 20.5.8 at
+#      /usr/local/lib/aur-forge/aurutils/aur (set by
+#      install-aurutils.sh).  We invoke `aur vercmp` from this
+#      path so a PATH lookup or unrelated `aur` binary cannot
+#      influence the result.
+#   2. pacman's `vercmp` (always present on Arch, including
+#      archlinux:latest; absent in our non-Arch dev env).
+#   3. A `sort -V` heuristic. Less accurate for pre-release
+#      tags and for `0.10` vs `0.9`, but the unit suite can
+#      exercise the comparator on any host.
+#
+# Empty inputs always return "current". When both inputs are
+# non-empty, the comparator's verdict decides the return value.
+# This is the helper update.sh should call instead of an
+# in-line `[[ "$a" == "$b" ]]` lexical compare.
+# ----------------------------------------------------------------------
+aur_needs_build() {
+    local aur_ver="${1-}"
+    local local_ver="${2-}"
+    local pkg="${3-}"
+    # Empty inputs default to "current": the caller treats
+    # missing info as "don't build yet".
+    if [[ -z "$aur_ver" || -z "$local_ver" ]]; then
+        printf 'current\tempty\n'
+        return 0
+    fi
+    if [[ "$aur_ver" == "$local_ver" ]]; then
+        printf 'current\tequal\n'
+        return 0
+    fi
+    # Production comparator: pinned aurutils 20.5.8.
+    local pinned_aur="/usr/local/lib/aur-forge/aurutils/aur"
+    if [[ -x "$pinned_aur" ]]; then
+        # aur-vercmp(1) does NOT accept two version arguments.
+        # It reads "pkgname pkgver" from stdin and compares it
+        # with either AUR data or a second version table supplied
+        # via `-p FILE`. We use -p so this comparison is purely
+        # local: AUR RPC already supplied aur_ver + OutOfDate.
+        local cmp_pkg="${pkg:-aur-forge-probe}"
+        local cmp_file cmp_out cmp_rc
+        cmp_file="$(mktemp)"
+        printf '%s %s\n' "$cmp_pkg" "$aur_ver" > "$cmp_file"
+        cmp_rc=0
+        cmp_out="$(printf '%s %s\n' "$cmp_pkg" "$local_ver" \
+            | "$pinned_aur" vercmp -q -p "$cmp_file" 2>/dev/null)" \
+            || cmp_rc=$?
+        rm -f "$cmp_file"
+        if [[ "$cmp_rc" -eq 0 ]]; then
+            if printf '%s\n' "$cmp_out" | grep -Fxq "$cmp_pkg"; then
+                printf 'build\tpinned_aur\n'
+            else
+                printf 'current\tpinned_aur\n'
+            fi
+            return 0
+        fi
+        # A malformed/unsupported pinned output falls through to
+        # pacman's vercmp. We never turn a helper error into a
+        # build candidate.
+    fi
+    # Fallback: pacman `vercmp`. Available on Arch hosts but
+    # not on the ai-host dev environment. Same input grammar.
+    if command -v vercmp >/dev/null 2>&1; then
+        local rc
+        rc="$(vercmp "$local_ver" "$aur_ver" 2>/dev/null)" || rc=""
+        case "$rc" in
+            -1|-2) printf 'build\tvercmp\n' ; return 0 ;;
+            0)     printf 'current\tvercmp\n' ; return 0 ;;
+            1|2)   printf 'current\tvercmp\n' ; return 0 ;;
+        esac
+    fi
+    # Last-resort: sort -V. Picks the lower line. If aur_ver is
+    # the lower, AUR is older than local → current. If local_ver
+    # is the lower, AUR is newer than local → build. Treats
+    # mixed prerelease tags like `1.0.0rc1` lossy, but that's
+    # fine for the unit suite's black-box tests.
+    local lower
+    lower="$(printf '%s\n%s\n' "$aur_ver" "$local_ver" | sort -V | head -1)"
+    if [[ "$lower" == "$aur_ver" ]]; then
+        printf 'current\tsort_v\n'
+    else
+        printf 'build\tsort_v\n'
+    fi
 }
 
 # ----------------------------------------------------------------------

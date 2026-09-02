@@ -106,6 +106,12 @@ unset PKGS
 
 # ---------------------------------------------------------------------
 # Phase 3: build the rebuild list.
+# Use aur_needs_build (an aurutils-aware comparator helper from
+# lib-aur.sh) instead of an inline [[ ... == ... ]]. The pinned
+# aurutils binary at /usr/local/lib/aur-forge/aurutils/aur is
+# preferred when present, with vercmp and sort -V fallbacks.
+# OutOfDate and approval state remain custom — those branches
+# still short-circuit before this comparator is called.
 # ---------------------------------------------------------------------
 TO_BUILD=()
 SKIPPED_OOD=()
@@ -116,17 +122,28 @@ for pkg in "${PKGS[@]}"; do
         NOT_FOUND+=( "$pkg" )
         continue
     fi
+    # OutOfDate policy: any non-null timestamp means maintainer
+    # flagged the package — skip with a warning even if the
+    # version is newer. This is custom aur-forge policy that the
+    # aurutils helpers do not model.
     if [[ "${AUR_OOD[$pkg]:-}" != "null" && -n "${AUR_OOD[$pkg]:-}" ]]; then
         SKIPPED_OOD+=( "$pkg" )
         continue
     fi
     aur_ver="${AUR_VER[$pkg]}"
     repo_ver="${REPO_VER[$pkg]:-}"
-    if [[ "$aur_ver" == "$repo_ver" && -n "$repo_ver" ]]; then
-        SKIPPED_UP_TO_DATE+=( "$pkg" )
-        continue
-    fi
-    TO_BUILD+=( "$pkg" )
+    verdict=""
+    verdict="$(aur_needs_build "$aur_ver" "$repo_ver" "$pkg" 2>/dev/null || true)"
+    case "$verdict" in
+        build*)   TO_BUILD+=( "$pkg" ) ;;
+        current*) SKIPPED_UP_TO_DATE+=( "$pkg" ) ;;
+        *)        # Comparator failed closed (sort_v fallback
+                   # covers this in practice). Treat as unknown
+                   # — do not build, count as up-to-date so the
+                   # next nightly run catches any change via the
+                   # RPC.
+                   SKIPPED_UP_TO_DATE+=( "$pkg" ) ;;
+    esac
 done
 
 echo "[update] upstream summary:"

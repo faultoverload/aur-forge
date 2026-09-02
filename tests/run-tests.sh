@@ -1483,6 +1483,30 @@ else
     pass "Dockerfile no longer clones aurutils.git directly"
 fi
 
+# The pinned installer must stage an actual runtime, not merely
+# an aurutils.pin metadata file. Dockerfile and helper share the
+# same project-owned paths. This regression was found during I6:
+# the first I5 helper ran `make` but never `make install`, so
+# /usr/local/lib/aur-forge/aurutils/aur did not exist at runtime.
+if grep -qF 'AURUTILS_LIB_DIR="${PIN_DEST}/lib"' "$AURUTILS_INSTALL" \
+   && grep -qE '^[[:space:]]*install[[:space:]]*$' "$AURUTILS_INSTALL"; then
+    pass "install-aurutils.sh stages wrapper + library tree via make install"
+else
+    fail "install-aurutils.sh stages wrapper + library tree via make install" \
+        "missing AURUTILS_LIB_DIR=$PIN_DEST/lib or install target"
+fi
+for runtime_path in \
+    '/usr/local/lib/aur-forge/aurutils/aur' \
+    '/usr/local/lib/aur-forge/aurutils/lib/aur-fetch' \
+    '/usr/local/lib/aur-forge/aurutils/lib/aur-vercmp'; do
+    if grep -qF "$runtime_path" <<<"$dockerfile_text"; then
+        pass "Dockerfile verifies pinned aurutils runtime path: $runtime_path"
+    else
+        fail "Dockerfile verifies pinned aurutils runtime path: $runtime_path" \
+            "path not asserted in Dockerfile"
+    fi
+done
+
 # README must document where the aurutils version comes from.
 # We don't pin a specific phrasing — just require that the
 # README mentions both `aurutils` and `aurutils.version`
@@ -1514,6 +1538,153 @@ if grep -E -q 'AUR_FETCH_CLONE_POLICY.*discard' <<<"$init_text" \
 else
     fail "init.sh documents discard as the AUR_FETCH_CLONE_POLICY default" \
         "expected 'discard' default per task spec"
+fi
+
+echo
+echo "=== aur_needs_build comparator (kanban t_f5dafbeb) ==="
+# ---------------------------------------------------------------
+# I6 contract: aur_needs_build is the comparator helper that
+# update.sh now uses. Pin its behavior so a future regression
+# in either the comparator or the comparator-selection logic
+# is caught by the unit suite. Sourcing is safe: lib-aur.sh
+# has no source-time side effects beyond default variable
+# expansions.
+# ---------------------------------------------------------------
+if [[ -s "${SCRIPTS}/lib-aur.sh" ]]; then
+    # shellcheck disable=SC1090
+    . "${SCRIPTS}/lib-aur.sh"
+fi
+
+if declare -F aur_needs_build >/dev/null 2>&1; then
+    # Helper exists.
+    pass "aur_needs_build is exposed by lib-aur.sh"
+
+    # Equal versions → current. The function short-circuits
+    # with "current\tequal" without ever calling the comparator
+    # binary.
+    eq_out="$(aur_needs_build "1.2.3" "1.2.3" 2>&1 || true)"
+    if [[ "$eq_out" == current* ]]; then
+        pass "equal versions resolve to 'current'"
+    else
+        fail "equal versions resolve to 'current'" "got: $eq_out"
+    fi
+
+    # Empty inputs default to "current" so a missing RPC
+    # answer never produces a phantom build.
+    empty_out="$(aur_needs_build "" "1.2.3" 2>&1 || true)"
+    if [[ "$empty_out" == current* ]]; then
+        pass "empty AUR version defaults to 'current' (fail-closed on unknown)"
+    else
+        fail "empty AUR version defaults to 'current'" "got: $empty_out"
+    fi
+    empty_out2="$(aur_needs_build "1.2.3" "" 2>&1 || true)"
+    if [[ "$empty_out2" == current* ]]; then
+        pass "empty local version defaults to 'current'"
+    else
+        fail "empty local version defaults to 'current'" "got: $empty_out2"
+    fi
+
+    # Comparator selection: when /usr/local/lib/aur-forge/
+    # aurutils/aur is executable, the helper reports
+    # "pinned_aur" as the comparator. When it isn't, it
+    # falls back. Either label is acceptable; the test
+    # asserts the helper doesn't leak comparator-internal
+    # errors.
+    out="$(aur_needs_build "2.0.0" "1.0.0" 2>&1 || true)"
+    case "$out" in
+        build*)     pass "AUR 2.0.0 vs local 1.0.0 → 'build' (comparator: ${out##*	})" ;;
+        *)          fail "AUR 2.0.0 vs local 1.0.0 → 'build'" "got: $out" ;;
+    esac
+
+    # Symmetric opposite: local 2.0.0 vs AUR 1.0.0 → 'current'.
+    out="$(aur_needs_build "1.0.0" "2.0.0" 2>&1 || true)"
+    case "$out" in
+        current*) pass "AUR older than local → 'current'" ;;
+        *)        fail "AUR older than local → 'current'" "got: $out" ;;
+    esac
+
+    # Comparator label sanity: the output's tab-separated
+    # second field is one of (empty, equal, pinned_aur, vercmp,
+    # sort_v). Anything else indicates a regression in the
+    # comparator-selection logic.
+    valid_labels_regex='^(empty|equal|pinned_aur|vercmp|sort_v)$'
+    valid_count=0
+    invalid_label=""
+    for case_pair in \
+        '1.0.0' '1.0.0' \
+        '1.0.0' '' \
+        '' '1.0.0' \
+        '1.0.0' '2.0.0'; do
+        : # noop sentinel: real iter handled in next loop body
+    done
+    while read -r aur local; do
+        [[ -z "$aur" ]] && continue
+        out="$(aur_needs_build "$aur" "$local" 2>&1 || true)"
+        label="${out#*	}"
+        [[ "$label" =~ $valid_labels_regex ]] \
+            && valid_count=$((valid_count+1)) \
+            || invalid_label="$invalid_label '$aur'->'$local'=$label"
+    done <<'PIVOT'
+1.0.0	1.0.0
+1.0.0	2.0.0
+2.0.0	1.0.0
+2.0.0	2.0.0
+1.5.0	1.0.0rc1
+PIVOT
+    if [[ -z "$invalid_label" ]]; then
+        pass "all comparator outputs use a known label ($valid_count/5)"
+    else
+        fail "all comparator outputs use a known label" \
+            "unknown label(s):$invalid_label"
+    fi
+else
+    fail "aur_needs_build is exposed by lib-aur.sh" "function missing"
+fi
+
+# update.sh now invokes aur_needs_build instead of an inline
+# lexical `==`. This is the surface that proves the helper is
+# wired into the production path. The lookup tolerates the
+# script's existing multi-candidate lookup so we match the
+# script's full path resolution.
+update_text="$(cat update.sh 2>/dev/null || true)"
+update_lib_lookup_lines="$(printf '%s\n' "$update_text" | grep -cE 'aur_needs_build' || true)"
+if (( update_lib_lookup_lines >= 1 )); then
+    pass "update.sh invokes aur_needs_build (not in-line lexical ==)"
+else
+    fail "update.sh invokes aur_needs_build" \
+        "no call site found in update.sh"
+fi
+
+# Forbidden patterns: update.sh must not bypass the helper with
+# in-line version comparison. A regression that reverts to an
+# in-line `[[ "$aur_ver" == "$repo_ver" ]]` lexical compare is
+# a regression even if aur_needs_build is also called.
+if printf '%s\n' "$update_text" | \
+   grep -E '\[\[[[:space:]]*"\$aur_ver"[[:space:]]*==[[:space:]]*"\$repo_ver"' >/dev/null 2>&1; then
+    fail "update.sh no longer uses inline lexical compare" \
+        "regression: in-line [[ ... == ... ]] compare detected"
+else
+    pass "update.sh no longer uses inline lexical compare"
+fi
+
+# out-of-date policy still lives in update.sh — aurutils does
+# not model OutOfDate. Verify that the OOD short-circuit remains
+# in place ahead of any comparator call. Match the real shell
+# form `${AUR_OOD[$pkg]:-}` rather than requiring a bare array
+# expression (the `:-` default is important under `set -u`).
+ood_line="$(printf '%s\n' "$update_text" \
+    | grep -nF 'AUR_OOD[$pkg]' \
+    | grep -F '!= "null"' \
+    | head -1 | cut -d: -f1 || true)"
+compare_line="$(printf '%s\n' "$update_text" \
+    | grep -nE '^[[:space:]]*verdict=.*aur_needs_build' \
+    | head -1 | cut -d: -f1 || true)"
+if [[ -n "$ood_line" && -n "$compare_line" ]] \
+   && (( ood_line < compare_line )); then
+    pass "OutOfDate short-circuit remains before aur_needs_build (lines $ood_line < $compare_line)"
+else
+    fail "OutOfDate short-circuit remains in update.sh" \
+        "OOD line=$ood_line comparator line=$compare_line"
 fi
 
 echo

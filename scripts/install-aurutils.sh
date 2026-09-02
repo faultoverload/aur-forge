@@ -236,18 +236,41 @@ install_pinned_aurutils() {
     fi
     log "sha256 OK"
 
-    # 4. Build via makepkg. The Dockerfile's pacman --noconfirm
-    # does the install. This script just produces the artifact.
+    # 4. Build and stage the runtime into the project-owned
+    # prefix. Do NOT rely on /usr/bin/aur from PATH: aur-forge
+    # resolves the wrapper at $PIN_DEST/aur and the wrapper is
+    # compiled with AURUTILS_LIB_DIR=$PIN_DEST/lib. This keeps the
+    # pinned runtime isolated from any distro/user aurutils.
     tar -xzf aurutils.tar.gz
     cd "aurutils-${AURUTILS_VERSION}"
-    make AURUTILS_VERSION="${AURUTILS_VERSION}" PREFIX=/usr ETCDIR=/etc
+    local stage_dir="${BUILD_DIR}/stage"
+    mkdir -p "$stage_dir" "$PIN_DEST"
+    make \
+        AURUTILS_VERSION="${AURUTILS_VERSION}" \
+        PREFIX="${PIN_DEST}" \
+        BINDIR="${PIN_DEST}" \
+        AURUTILS_LIB_DIR="${PIN_DEST}/lib" \
+        ETCDIR="${PIN_DEST}/etc" \
+        DESTDIR="$stage_dir" \
+        install
 
-    # 5. Drop the artifact + runtime pin in the canonical
-    # project-owned location that the Dockerfile picks up.
-    mkdir -p "$PIN_DEST"
-    cp -f ../aurutils.tar.gz "$PIN_DEST/aurutils-${AURUTILS_VERSION}.tar.gz"
-    cp -f aurutils-*.pkg.tar.zst "$PIN_DEST/" 2>/dev/null || true
+    # Copy the staged prefix into the final project-owned location.
+    # `cp -a source/. dest/` includes dotfiles and preserves modes.
+    cp -a "${stage_dir}${PIN_DEST}/." "$PIN_DEST/"
 
+    # The wrapper + library are the runtime contract used by
+    # aur-fetch-wrapper.sh and lib-aur.sh. Fail the image build if
+    # either side is absent rather than leaving a pin-only directory.
+    [[ -x "$PIN_DEST/aur" ]] \
+        || die 2 "staged aur wrapper missing at $PIN_DEST/aur"
+    [[ -x "$PIN_DEST/lib/aur-fetch" ]] \
+        || die 2 "staged aur-fetch library missing at $PIN_DEST/lib/aur-fetch"
+    [[ -x "$PIN_DEST/lib/aur-vercmp" ]] \
+        || die 2 "staged aur-vercmp library missing at $PIN_DEST/lib/aur-vercmp"
+
+    # 5. Record the verified runtime pin next to the installed
+    # wrapper/library tree. No generated key material or network
+    # response bodies are retained.
     cat > "$PIN_DEST/aurutils.pin" <<EOF
 AURUTILS_VERSION=${AURUTILS_VERSION}
 AURUTILS_COMMIT=${AURUTILS_COMMIT}
