@@ -23,8 +23,9 @@
 # On SIGTERM, lighttpd gets SIGTERM (it shuts down cleanly in <1s) and
 # the scheduler exits its current sleep. Container exit code 0.
 #
-# All output is line-buffered and goes to stdout so Komodo / docker logs
-# can capture it.
+# All output goes to stdout/stderr. aur-forge.service binds both streams
+# to Docker's PTY-backed /dev/console, so Komodo / `docker logs` captures
+# run.sh, scheduler, lighttpd, and synchronous child-script output.
 set -uo pipefail
 
 PORT="${PORT:-8080}"
@@ -46,6 +47,7 @@ LOG_TAG="[$(date -u +%FT%TZ)]"
 DARKHTTD_PID=""  # legacy name; now holds the lighttpd PID. Renaming would
                  # break the cleanup() function below, so kept as-is.
 SCHED_PID=""
+LOG_FORWARD_PID=""
 
 cleanup() {
     local sig="$1"
@@ -64,15 +66,45 @@ cleanup() {
         done
         kill -KILL "${DARKHTTD_PID}" 2>/dev/null || true
     fi
-    # Reap both.
+    if [[ -n "${LOG_FORWARD_PID}" ]] && kill -0 "${LOG_FORWARD_PID}" 2>/dev/null; then
+        kill -TERM "${LOG_FORWARD_PID}" 2>/dev/null || true
+    fi
+    # Reap all managed children.
     wait "${SCHED_PID}" 2>/dev/null || true
     wait "${DARKHTTD_PID}" 2>/dev/null || true
+    wait "${LOG_FORWARD_PID}" 2>/dev/null || true
     exit 0
 }
 
 trap 'cleanup TERM' TERM
 trap 'cleanup INT'  INT
 trap 'cleanup HUP'  HUP
+
+# ---------------------------------------------------------------------
+# Forward file-only child logs into the service stream.
+# ---------------------------------------------------------------------
+# check.cgi detaches update.sh with nohup and deliberately writes to its
+# own file. lighttpd likewise owns access/error logs rather than emitting
+# them on its inherited stdout/stderr. Start at the current EOF so a
+# systemd service restart does not replay duplicate lines; the forwarder
+# starts before either producer, so no new startup lines are missed.
+# tail -F survives later file rotation. The forwarder itself inherits
+# this unit's /dev/console stdout, so every forwarded line lands in
+# Docker's json-file stream.
+mkdir -p /var/log/aur-forge-lighttpd
+touch /var/log/aur-forge-check.log \
+      /var/log/aur-forge-lighttpd/error.log \
+      /var/log/aur-forge-lighttpd/access.log
+chown 999:1000 \
+      /var/log/aur-forge-check.log \
+      /var/log/aur-forge-lighttpd \
+      /var/log/aur-forge-lighttpd/error.log \
+      /var/log/aur-forge-lighttpd/access.log
+tail -q -n 0 -F \
+    /var/log/aur-forge-check.log \
+    /var/log/aur-forge-lighttpd/error.log \
+    /var/log/aur-forge-lighttpd/access.log &
+LOG_FORWARD_PID=$!
 
 # ---------------------------------------------------------------------
 # Scheduler — the night loop.

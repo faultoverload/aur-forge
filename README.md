@@ -137,6 +137,40 @@ key by `rm -rf /opt/docker/data/aur-forge/keys/*` + restart.
   you're bootstrapping a fresh `/pkglist` and want human eyes on each
   new approval.
 
+### Logs
+
+The 24/7 service runs under systemd-as-PID-1 (`/sbin/init --system`).
+Bare systemd in a Docker container traditionally ends up with PID 1
+pointing its stdout/stderr at `/dev/null` because Docker does not
+allocate a TTY by default — so `docker logs aur-forge` historically
+showed nothing even though `journalctl -u aur-forge` inside the
+container saw the full stream.
+
+To make `docker logs` the canonical surface for service output we
+pair **Docker** `tty: true` with **systemd**
+`StandardOutput=tty TTYPath=/dev/console`. Docker allocates a PTY
+for PID 1; that PTY surfaces inside the container as a real
+`/dev/console` (mode 620, root:tty). The unit's sink opens the device
+on both stdout and stderr, so every line from `run.sh`, the nightly
+scheduler, `lighttpd`, and synchronous child scripts lands on
+Docker's json-file stream.
+
+- View the live stream: `docker logs -f aur-forge`
+- Tail recent: `docker logs --tail 200 aur-forge`
+- Filter for the scheduler only:
+  `docker logs aur-forge 2>&1 | grep '\[scheduler\]'`
+- Lighttpd access/error lines and web-triggered update output are also
+  forwarded into `docker logs`; their original files stay available
+  under `/var/log/aur-forge-lighttpd/` and
+  `/var/log/aur-forge-check.log` for focused troubleshooting.
+
+Both required pieces of wiring live in this repo:
+`docker-compose.sample.yml` declares `tty: true` on every service,
+and `aur-forge.service` declares `StandardOutput=tty`,
+`StandardError=tty`, `TTYPath=/dev/console`. Production deploys through
+Komodo must keep the same directives in the production compose /
+image.
+
 ## Drain procedure
 
 `scripts/drain-quarantine.sh` walks the `quarantine/*` label set and

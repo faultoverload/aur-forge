@@ -1688,6 +1688,98 @@ else
 fi
 
 echo
+echo "=== Docker/systemd log forwarding (kanban t_f6230d3a) ==="
+# The long-running `run` mode execs systemd as PID 1. In a non-TTY
+# container systemd closes its inherited stdout/stderr and /dev/console
+# does not exist, so service output remains journal-only and `docker logs`
+# is empty. The supported wiring is a Docker PTY plus an explicit systemd
+# TTY sink: Docker creates /dev/console on the PTY and the unit opens both
+# output streams on that device. These assertions pin every required link.
+compose_text="$(cat "${REPO_ROOT}/docker-compose.sample.yml")"
+service_text="$(cat "${REPO_ROOT}/aur-forge.service")"
+entrypoint_text="$(cat "${REPO_ROOT}/entrypoint.sh")"
+readme_text="$(cat "${REPO_ROOT}/README.md")"
+
+# Both sample services can run long-lived commands; keep their runtime
+# contract identical so changing profiles cannot silently lose logging.
+compose_tty_count="$(grep -cE '^[[:space:]]+tty:[[:space:]]+true([[:space:]]*(#.*)?)?$' <<<"$compose_text" || true)"
+assert_eq "$compose_tty_count" "2" \
+    "docker-compose.sample.yml allocates a TTY for both services"
+compose_json_log_count="$(grep -cE '^[[:space:]]+driver:[[:space:]]+json-file([[:space:]]*(#.*)?)?$' <<<"$compose_text" || true)"
+assert_eq "$compose_json_log_count" "2" \
+    "docker-compose.sample.yml explicitly uses json-file logging"
+compose_rotation_count="$(grep -cF 'max-size: "10m"' <<<"$compose_text" || true)"
+assert_eq "$compose_rotation_count" "2" \
+    "docker-compose.sample.yml keeps 10m json-file rotation"
+
+if grep -qE '^StandardOutput=tty$' <<<"$service_text" \
+   && grep -qE '^StandardError=tty$' <<<"$service_text"; then
+    pass "aur-forge.service sends stdout and stderr to the TTY"
+else
+    fail "aur-forge.service sends stdout and stderr to the TTY" \
+        "expected StandardOutput=tty and StandardError=tty"
+fi
+if grep -qE '^TTYPath=/dev/console$' <<<"$service_text"; then
+    pass "aur-forge.service targets Docker's /dev/console PTY"
+else
+    fail "aur-forge.service targets Docker's /dev/console PTY" \
+        "expected TTYPath=/dev/console"
+fi
+# Guard the exact invalid setting that systemd silently ignores.
+if grep -qE '^Standard(Output|Error)=console$' <<<"$service_text"; then
+    fail "aur-forge.service has no invalid Standard*=console directive" \
+        "systemd ignores 'console'; use 'tty' with TTYPath=/dev/console"
+else
+    pass "aur-forge.service has no invalid Standard*=console directive"
+fi
+
+if grep -qF 'exec /sbin/init --system' <<<"$entrypoint_text"; then
+    pass "entrypoint.sh preserves systemd as PID 1"
+else
+    fail "entrypoint.sh preserves systemd as PID 1" \
+        "run mode must still exec /sbin/init --system"
+fi
+
+# check.cgi intentionally detaches its update job and writes to a file;
+# lighttpd also owns separate access/error files. run.sh must forward all
+# three files into its inherited stdout without changing those producers.
+run_text="$(cat "${REPO_ROOT}/run.sh")"
+for forwarded_log in \
+    /var/log/aur-forge-check.log \
+    /var/log/aur-forge-lighttpd/error.log \
+    /var/log/aur-forge-lighttpd/access.log; do
+    if grep -qF "$forwarded_log" <<<"$run_text"; then
+        pass "run.sh forwards ${forwarded_log} to the service stream"
+    else
+        fail "run.sh forwards ${forwarded_log} to the service stream" \
+            "log-only child output would remain invisible to docker logs"
+    fi
+done
+if grep -qF 'tail -q -n 0 -F' <<<"$run_text" \
+   && grep -qF 'LOG_FORWARD_PID=$!' <<<"$run_text" \
+   && grep -qF 'kill -TERM "${LOG_FORWARD_PID}"' <<<"$run_text"; then
+    pass "run.sh starts and stops the file-log forwarder"
+else
+    fail "run.sh starts and stops the file-log forwarder" \
+        "expected tail -F lifecycle under LOG_FORWARD_PID"
+fi
+
+if grep -qF 'docker logs aur-forge' <<<"$readme_text" \
+   && grep -qF 'tty: true' <<<"$readme_text" \
+   && grep -qF 'StandardOutput=tty' <<<"$readme_text"; then
+    pass "README documents Docker log viewing and required TTY wiring"
+else
+    fail "README documents Docker log viewing and required TTY wiring" \
+        "expected docker logs command, tty: true, and StandardOutput=tty"
+fi
+if grep -qE '`docker logs[^`]*`[^\n]*(returns|is)[^\n]*(0 bytes|empty)' <<<"$readme_text"; then
+    fail "README no longer claims docker logs is empty" \
+        "stale operator guidance still present"
+else
+    pass "README no longer claims docker logs is empty"
+fi
+
+echo
 echo "=== summary ==="
 echo "passed: $PASS"
 echo "failed: $FAIL"

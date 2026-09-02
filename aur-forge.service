@@ -1,52 +1,66 @@
+# aur-forge service — runs run.sh under systemd as PID 1.
+#
+# run.sh is intentionally a single bash process that starts lighttpd
+# in the background and then runs the nightly scheduler in the same
+# shell; systemd manages one process group, not separate units. This
+# preserves the original 24/7 design where lighttpd + scheduler are
+# children of one bash, so SIGTERM from systemd cleans up both.
+
 [Unit]
 Description=aur-forge — AUR build farm (24/7 mode)
 Documentation=https://github.com/faultoverload/aur-forge
-# Wait for the journal so log output is captured before our service starts.
-#
-# NOTE: deliberately NOT ordering against network-online.target. In Docker
-# containers, systemd-networkd-wait-online.service fails (Docker doesn't
-# satisfy the "online" condition for systemd's network checks — networkctl
-# shows "State: routable" with "Online state: unknown", which wait-online
-# treats as failure). That failure was blocking aur-forge.service from ever
-# auto-starting in fresh containers, leaving lighttpd dead and Traefik
-# returning 404 to every request. The AUR RPC + signing operations inside
-# run.sh / build.sh handle their own transient-network-retry logic, so
-# ordering against network-online.target buys us nothing.
+# After journal so any unit manager setup messages are captured first.
 After=systemd-journald.service
 
 [Service]
 Type=simple
-# run.sh calls init.sh (idempotent), starts lighttpd in the
-# background, then starts the nightly scheduler. It traps SIGTERM
-# and forwards to both children. systemd manages the whole process
-# group as a single Type=simple unit — lighttpd + scheduler are
-# direct children of the bash process, not separate units. This
-# preserves the original 24/7 single-PID-group design.
 ExecStart=/usr/local/bin/run.sh
 # SIGTERM forward: run.sh's trap exits 0 within ~60s. After that
 # systemd treats it as a clean stop and restarts per policy.
 Restart=always
 RestartSec=5
-# run.sh drops privileges internally via sudo -u builder for
-# makepkg. systemd-nspawn inside extra-x86_64-build needs
-# CAP_SYS_ADMIN for chroot mount plumbing, so the service must run
-# as root rather than as a dedicated user.
+# run.sh drops privileges internally via sudo -u builder for makepkg.
+# systemd-nspawn inside extra-x86_64-build needs CAP_SYS_ADMIN for
+# chroot mount plumbing, so the service must run as root.
 User=root
-# Surface run.sh's stdout/stderr to PID 1's stdout so `docker logs`
-# captures it. The journal+console setting that lived here before
-# worked on real systemd (journald indexes the log AND the console
-# sink forwards to PID 1's TTY), but breaks inside Docker containers:
-# the console sink tries to write to a TTY that isn't attached to
-# PID 1's stdout, and journald's ring buffer is never flushed to
-# PID 1's pipe — so `docker logs` returns 0 bytes for the lifetime
-# of the container, even though journalctl -u aur-forge from inside
-# the container sees the full stream. Drop `journal+` and keep only
-# `console`: that's the FD Docker's conmon is reading. The trade-off
-# is no journald indexing inside the container, but since /var/log/journal
-# isn't persistent across container restarts anyway, that wasn't
-# really buying anything.
-StandardOutput=console
-StandardError=console
+
+# ----- Docker log forwarding (kanban t_f6230d3a) ---------------------
+# Background: PID 1 in a non-TTY container is /sbin/init --system
+# (the entrypoint's `run` subcommand), and systemd-as-PID-1 closes
+# its inherited stdout/stderr as soon as it detects there is no
+# controlling terminal. The journal socket still receives service
+# lines so `journalctl -u aur-forge` from inside the container sees
+# the full stream — but `docker logs` only sees whatever PID 1
+# (systemd) writes to its own stdout/stderr, which now point at
+# /dev/null. That is why `docker logs aur-forge` previously returned
+# nothing for the lifetime of the container.
+#
+# The fix that survived the runtime check: pair Docker's `tty: true`
+# with systemd's TTY sink. Docker allocates a PTY for PID 1, which
+# surfaces inside the container as a real /dev/console character
+# device owned by root:tty mode 620. Setting StandardOutput=tty +
+# TTYPath=/dev/console binds the unit's stdout AND stderr to that
+# PTY. systemd's own tty machinery opens the device, and because
+# /dev/console is the same PTY Docker's logging driver is reading
+# from, every line writes into the Docker json-file stream that
+# `docker logs` consumes.
+#
+# Why this is safe for our service: Type=simple, no getty, no
+# interactive prompt. The TTY sink behaves exactly like a writeable
+# file for our purposes; run.sh and its bash children inherit an
+# FD that's already pointing at /dev/console.
+#
+# We deliberately use `tty` (NOT `console`). The literal value
+# `console` is silently rejected by modern systemd (it tries to
+# route through kmsg + journald's "console" target, which is not
+# valid as a service output specifier), so the old `StandardOutput=
+# console` line was being parsed away and the journal was the only
+# destination. This service intentionally wants raw bytes to /dev/
+# console, which is what `tty` gives us.
+# ---------------------------------------------------------------------
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/console
 
 [Install]
 WantedBy=multi-user.target

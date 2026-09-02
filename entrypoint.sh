@@ -17,6 +17,16 @@
 # subcommands (init / build / serve / update / drain) keep the original
 # direct-exec behavior — those are invoked manually via docker exec
 # for one-shot operations and don't need systemd-nspawn plumbing.
+#
+# Log capture note (kanban t_f6230d3a): the entrypoint hands off to
+# systemd cleanly here. The trick that makes `docker logs` show real
+# service output lives in aur-forge.service (StandardOutput=tty +
+# TTYPath=/dev/console) and docker-compose.sample.yml (`tty: true`).
+# Together they route the unit's stdout/stderr through /dev/console,
+# which Docker exposes as the PTY it's logging from. Without those
+# two pieces of wiring systemd-as-PID-1 closes its inherited FDs
+# (which now point at /dev/null) and the journal is the only source
+# of service lines — see aur-forge.service for the full rationale.
 set -euo pipefail
 
 CMD="${1:-help}"
