@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # aur-forge entrypoint — dispatches init|build|serve|update|drain|run|help
 # based on argv[1]. All persistent state lives in /repo (served),
-# /cache (chroots + ccache), /keys (GPG keyring), /pkglist (one package
-# per line), /approvals (PKGBUILD approval JSON, one file per package).
+# /cache (chroot roots between runs), /keys (GPG keyring), /pkglist
+# (one package per line), /approvals (PKGBUILD approval JSON, one
+# file per package).
 #
 # The 'run' mode is the long-running 24/7 service: starts darkhttpd in
 # the background and a scheduler that runs the full nightly sequence
@@ -69,11 +70,24 @@ Usage:
   aur-forge help            This message.
 
 State directories (bind-mount these from the host):
-  /repo       Served output: x86_64/*.pkg.tar.zst, *.db, *.sig
-  /cache      Chroot roots + ccache between runs
-  /keys       GPG keyring (persist; survives container rebuilds)
-  /pkglist    File with one AUR package name per line
-  /approvals  PKGBUILD approval JSON store (one file per package)
+  /repo                Served output: x86_64/*.pkg.tar.zst, *.db, *.sig
+  /cache               Host-backed cache volume. Contains three distinct
+                       subtrees that must not be confused:
+                         /cache/work              AUR source/work cache
+                                                  (makepkg SRCDEST)
+                         /cache/work-quarantine   Quarantined cloned trees
+                                                  (gate deny)
+                         /cache/pacman/pkg        Official Arch package
+                                                  cache (pacman CacheDir,
+                                                  patched to be FIRST so
+                                                  arch-nspawn binds it RW
+                                                  into the build chroot)
+  /keys                GPG keyring (persist; survives container rebuilds)
+  /pkglist             File with one AUR package name per line
+  /approvals           PKGBUILD approval JSON store (one file per package)
+
+The clean build chroot itself (/var/lib/archbuild/extra-x86_64/)
+is in-container and rebuilt per build — not bind-mounted.
 
 Quarantine control:
   STRICT_FIRST_BUILD=1   Force human review on first build of a package

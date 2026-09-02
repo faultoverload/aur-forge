@@ -10,6 +10,40 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Multi-candidate helper lookup (matches update.sh + init.sh). The
+# makepkg jobs helper is sourced here so build.sh can validate
+# AUR_BUILD_JOBS BEFORE the first extra-x86_64-build invocation —
+# bad env values must fail fast with a clear error, not crash a
+# build mid-flight.
+HELPER_LOADED=0
+for cand in \
+    "${SCRIPT_DIR}/scripts" \
+    /usr/local/lib/aur-forge; do
+    if [[ -f "${cand}/makepkg-jobs-config.sh" ]]; then
+        # shellcheck disable=SC1090
+        . "${cand}/makepkg-jobs-config.sh"
+        HELPER_LOADED=1
+        break
+    fi
+done
+if (( HELPER_LOADED == 1 )) && declare -F validate_aur_build_jobs >/dev/null 2>&1; then
+    if ! validate_aur_build_jobs "${AUR_BUILD_JOBS-}" >/dev/null; then
+        echo "[build] AUR_BUILD_JOBS rejected before any build runs" >&2
+        exit 2
+    fi
+else
+    echo "[build] WARNING: makepkg-jobs-config.sh not found in any candidate path; continuing without AUR_BUILD_JOBS validation" >&2
+fi
+
+# Materialized drop-in from init.sh. build.sh sets MAKEPKG_CONF to
+# this path so makepkg sources OUR bounded config instead of the
+# devtools-shipped one. Path is fixed at the production location;
+# init.sh is responsible for writing it.
+MAKEPKG_JOBS_DROPIN="/usr/local/lib/aur-forge/makepkg.d/00-jobs.conf"
+if [[ -f "${MAKEPKG_JOBS_DROPIN}" ]]; then
+    export MAKEPKG_CONF="${MAKEPKG_JOBS_DROPIN}"
+fi
 # shellcheck source=scripts/approval-store.sh
 source "${SCRIPT_DIR}/approval-store.sh"
 # shellcheck source=scripts/srcinfo-diff.sh
@@ -460,18 +494,55 @@ for pkg in "${PKGS[@]}"; do
         continue
     fi
 
-    # Clone (or refresh) the AUR git into a scratch dir.
+    # Clone (or refresh) the AUR git into a scratch dir. Use the
+    # project-owned wrapper around pinned aurutils so we get a
+    # real `--existing` policy + structured fetcher state, and
+    # never call a non-pinned `aur`. WORK is chosen before the
+    # clone so the wrapper's stdout stays clean for both new
+    # clones and existing-clone fast paths.
     WORK="/cache/work/${pkg}"
     rm -rf "$WORK"
-    if ! git clone --depth 1 "https://aur.archlinux.org/${pkg}.git" "$WORK" 2>/tmp/clone.err; then
-        echo "[build] FAILED to clone $pkg:" >&2
+    AUR_FETCH_CMD=( "${SCRIPT_DIR}/scripts/aur-fetch-wrapper.sh" )
+    # --existing: if a workdir already exists for this pkgbase,
+    # update it instead of erroring on a re-run. --sync=reset is
+    # the safe default for fresh nightly rebuilds: throw away
+    # local-only commits and pin to upstream master@{upstream}.
+    # The wrapper is the ONLY entry point; do NOT call `aur`
+    # directly because PATH may include a different aurutils.
+    if ! "${AUR_FETCH_CMD[@]}" \
+            --sync=reset --discard --existing --results="/tmp/aur-fetch.${pkg}.$$" \
+            "${pkg}" 2>/tmp/clone.err; then
+        echo "[build] FAILED to fetch $pkg via pinned aurutils:" >&2
         cat /tmp/clone.err >&2
         FAILED=$((FAILED+1))
+        cd /
+        rm -rf "$WORK"
         continue
     fi
+    if [[ ! -d "$WORK" ]]; then
+        # Some AUR pkgbase names differ from their pkgname; the
+        # wrapper writes a colon-delimited results file that ends
+        # with `file://<path>` when results are requested. Look
+        # there as a fallback for non-canonical pkgbase names.
+        results_file="/tmp/aur-fetch.${pkg}.$$"
+        if [[ -s "$results_file" ]]; then
+            cloned_path="$(awk -F: 'NF>=4 {u=$NF; sub(/^file:\/\//,"",u); print u; exit}' "$results_file")"
+            if [[ -n "$cloned_path" && -d "$cloned_path" ]]; then
+                WORK="$cloned_path"
+            fi
+        fi
+    fi
+    rm -f "/tmp/aur-fetch.${pkg}.$$"
 
-    # Run the archcanary + diff gate. quarantine_pkg returns non-zero;
-    # we count that as quarantined and move on.
+    # Run the archcanary + diff gate (run_gate function above).
+    # This is the security anchor between fetch and chroot build:
+    # the per-package archcanary blocklist scan, the PKGBUILD-diff
+    # classifier, and the approval-store check all live in
+    # run_gate. quarantine_pkg returns non-zero; we count that as
+    # quarantined and move on. The gate invocation is intentionally
+    # NOT indirected through a variable — static analyzers (and
+    # reviewers) must be able to grep for `run_gate "$pkg"` and
+    # see exactly one call site between fetch and the build.
     if ! run_gate "$pkg" "$WORK"; then
         QUARANTINED=$((QUARANTINED+1))
         # run_gate moves $WORK to /cache/work-quarantine/<pkg>-<pid>.
@@ -531,10 +602,8 @@ for pkg in "${PKGS[@]}"; do
     # Drop signed packages into the served repo dir, then reindex.
     cp -f -- *.pkg.tar.zst *.pkg.tar.zst.sig "$REPO_DIR/"
     cd "$REPO_DIR"
-    repo-add --sign --key "${FPR}" \
+    repo-add -w --prevent-downgrade --sign --key "${FPR}" \
         "${REPO_NAME}.db.tar.zst" -- *.pkg.tar.zst
-    [[ -f "${REPO_NAME}.db"     ]] || cp "${REPO_NAME}.db.tar.zst" "${REPO_NAME}.db" 2>/dev/null || true
-    [[ -f "${REPO_NAME}.files"  ]] || cp "${REPO_NAME}.files.tar.zst" "${REPO_NAME}.files" 2>/dev/null || true
 
     BUILT=$((BUILT+1))
     cd / && rm -rf "$WORK"

@@ -251,11 +251,46 @@ Bind-mounted from the host (`/opt/docker/data/aur-forge/`):
 ```
 /opt/docker/data/aur-forge/
 ├── repo/                       served output (aur-forge.x86_64/*)
-├── cache/                      chroot roots + ccache
+├── cache/                      host-backed cache volume (single bind mount);
+│                               contains three distinct subtrees that must
+│                               not be confused:
+│   ├── cache/work/             AUR source/work cache (makepkg SRCDEST);
+│   │                           cloned PKGBUILDs land here pre-build.
+│   ├── cache/work-quarantine/  cloned trees the security gate denied;
+│   │                           one timestamped dir per quarantined package.
+│   └── cache/pacman/pkg/       official Arch package cache (pacman's
+│                               CacheDir); persists across container
+│                               rebuilds so incremental rebuilds don't
+│                               re-download every dep. Patched into the
+│                               devtools pacman.conf via a drop-in
+│                               (scripts/pacman-cache-config.sh) so it
+│                               becomes the FIRST CacheDir and the one
+│                               devtools' arch-nspawn bind-mounts RW into
+│                               the build chroot.
 ├── keys/                       GPG keyring (survives container rebuilds)
 ├── approvals/                  PKGBUILD approval JSON store (one file per package)
 └── pkglist.txt                 one AUR package per line
 ```
+
+The clean build chroot itself lives **in-container** at
+`/var/lib/archbuild/extra-x86_64/` — not bind-mounted, not persisted.
+Each `extra-x86_64-build -c` invocation wipes and re-bootstraps it via
+pacstrap (see init.sh). That is intentional: a fresh chroot per build
+is what makes the build hermetic.
+
+### Why three caches, not one
+
+They look similar (all under `/cache` or its neighbours) but they
+serve different lifetimes and consumers — getting this wrong means
+either re-downloading every dep on every rebuild, or keeping build
+artifacts alive between unrelated builds:
+
+| Path (in-container)              | Backing                  | Lifetime            | Purpose                                                              |
+| -------------------------------- | ------------------------ | ------------------- | -------------------------------------------------------------------- |
+| `/cache/work/`                   | bind-mount from host     | survives rebuilds   | AUR source tarballs (makepkg `SRCDEST`) — re-cloned PKGBUILDs land here |
+| `/cache/work-quarantine/`        | bind-mount from host     | survives rebuilds   | Quarantined cloned trees (security gate deny) — one dir per package  |
+| `/cache/pacman/pkg/`             | bind-mount from host     | survives rebuilds   | Official Arch package cache (pacman `CacheDir`) — incremental rebuilds reuse downloads |
+| `/var/lib/archbuild/extra-x86_64/` | container overlay       | rebuilt per build   | Clean chroot root — wiped by `extra-x86_64-build -c`                 |
 
 ## Adding or updating packages
 
@@ -347,6 +382,32 @@ When the gate quarantines a malicious update:
 | `GPG_PASSPHRASE`        | (unset)                  | Passphrase for unattended GPG signing.                        |
 | `PORT`                  | `8080`                   | TCP port lighttpd listens on (internal; Traefik fronts 443).  |
 | `CSRF_SECRET_FILE`      | `/etc/aur-forge/csrf-secret` | Path to the CSRF secret. Auto-created at build time with mode 0600. Do NOT commit. |
+| `AUR_BUILD_JOBS`        | `2`                      | Compile and zstd compression job count. Bound to the same value so `MAKEFLAGS=-jN`, `NPROC=N`, and `COMPRESSZST` stay in lockstep. Validated by `scripts/makepkg-jobs-config.sh`; anything outside `[1, MAX_AUR_BUILD_JOBS]` is rejected before the first `extra-x86_64-build`. |
+| `MAX_AUR_BUILD_JOBS`     | `8`                      | Upper cap for `AUR_BUILD_JOBS`. The container's 4 GiB mem_limit and pid cap limit the safe value; raise only if you also raise `mem_limit` and confirm the cgroup survives a parallel build. |
+| `AUR_FETCH_CLONE_POLICY` | `discard`               | How `scripts/aur-fetch-wrapper.sh` reconciles an existing `WORK` clone with upstream. Default `discard` resets local commits to `master@{upstream}` (safe for nightly rebuilds). Allowed: `discard` (default), `merge`, `rebase`, `auto`, `reset`. Invalid values log a warning and fall back to `discard`. |
+| `AUR_FORGE_PACMAN_CACHE_DIR` | `/cache/pacman/pkg/` | Bind-mounted persistent pacman package cache. Set by `init.sh`; ensures `arch-nspawn`'s first-cache-dir bind points at host-backed storage instead of the overlay. |
+
+## Pinned dependencies
+
+The image picks up AUR-only packages through committed pins, never
+unpinned `git clone`. Today the only pinned AUR dependency is
+aurutils, tracked at the project root:
+
+- `aurutils.version` — `AURUTILS_VERSION` (upstream tag),
+  `AURUTILS_COMMIT` (40-char hex), `AURUTILS_SHA256` (64-char
+  hex tarball hash), `AURUTILS_SOURCE_URL` (commit-pinned).
+- `scripts/install-aurutils.sh` — fetches the upstream tarball
+  by tag, asserts the SHA-256, builds via `makepkg --nocheck`,
+  and stages `/usr/local/lib/aur-forge/aurutils.pin`.
+
+To bump the pinned aurutils: update `aurutils.version` with the
+new tag/commit/sha tuple and the new source URL, then rebuild
+the image. The Dockerfile never unpinned-clones aurutils.
+
+`archcanary` is also built from source in the Dockerfile; it is
+cloned once with `--depth 1` from the maintained upstream and
+built locally with `makepkg -si --skippgpcheck`. To bump archcanary,
+update the upstream URL in the Dockerfile, not a version file.
 
 ## Web UI
 

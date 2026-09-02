@@ -60,38 +60,36 @@ RUN pacman -Syu --noconfirm \
  && pacman -Scc --noconfirm \
  && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
 
-# Install archcanary (musqz/archcanary) + aurutils (AUR helpers) from
-# source. Both are AUR-only packages, never in [core]/[extra], so they
-# can't be installed with pacman. We clone each repo, run `makepkg -si`
-# as a non-root user, and rely on the deps we pre-installed above.
-#
-# Both packages are passed --skippgpcheck to disable makepkg's source-
-# file signature verification. The AUR does not require PKGBUILD source
-# signatures and missing PGP keys in a clean chroot otherwise cause the
-# build to fail with "SIGNATURE NOT FOUND". The actual package
-# artifacts are signed at build time by aur-forge's GPG key (see
-# build.sh / repo-add), so this does not weaken repo integrity.
-#
+# Install archcanary (musqz/archcanary) from pinned source. We use
+# the project-owned pin file + install helper for aurutils (rather
+# than an unpinned `git clone`) so future tag rewrites cannot
+# silently change the production image.
+COPY --chown=root:root aurutils.version /usr/local/lib/aur-forge/aurutils.version
+COPY --chown=root:root scripts/install-aurutils.sh /usr/local/lib/aur-forge/install-aurutils.sh
+COPY --chown=root:root scripts/aur-fetch-wrapper.sh /usr/local/lib/aur-forge/aur-fetch-wrapper.sh
 # Note: makepkg refuses to build as root, so we drop to a temp user,
 # build, then install the resulting packages as root. This is the same
 # pattern documented at https://wiki.archlinux.org/title/Makepkg#Building_as_a_different_user
 RUN useradd -m -s /bin/bash tmpbuild \
     && passwd -d tmpbuild \
+    && chmod 0755 /usr/local/lib/aur-forge/install-aurutils.sh /usr/local/lib/aur-forge/aur-fetch-wrapper.sh \
     && echo "tmpbuild ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tmpbuild \
     && sudo -u tmpbuild bash -c 'set -euo pipefail; \
         cd /tmp && \
         git clone --depth 1 https://github.com/musqz/archcanary.git && \
         cd archcanary/packaging && \
-        makepkg -si --noconfirm --skippgpcheck && \
-        cd /tmp && \
-        git clone --depth 1 https://aur.archlinux.org/aurutils.git && \
-        cd aurutils && \
         makepkg -si --noconfirm --skippgpcheck' \
-    && rm -rf /tmp/archcanary /tmp/aurutils \
+    && AURUTILS_PIN_FILE=/usr/local/lib/aur-forge/aurutils.version \
+       AUR_BUILD_INSTALL_AURUTILS=1 \
+       bash /usr/local/lib/aur-forge/install-aurutils.sh \
+    && rm -rf /tmp/archcanary /tmp/aurutils-* /usr/local/lib/aur-forge/aurutils-*tar.gz \
     && userdel -r tmpbuild 2>/dev/null || true \
     && rm -f /etc/sudoers.d/tmpbuild \
     && archcanary --help >/dev/null || { echo "archcanary install failed"; exit 1; } \
-    && command -v aur >/dev/null || { echo "aurutils install failed"; exit 1; }
+    && test -x /usr/local/lib/aur-forge/aurutils/aur \
+    && test -x /usr/local/lib/aur-forge/aurutils/lib/aur-fetch \
+    && test -x /usr/local/lib/aur-forge/aurutils/lib/aur-vercmp \
+    || { echo "pinned aurutils install failed"; exit 1; }
 
 # Make pacman + makepkg happy in a containerized chroot. makepkg runs
 # extra-x86_64-build which creates its own chroot via pacstrap — no
@@ -126,16 +124,54 @@ RUN useradd -m -s /bin/bash builder \
 # needed.
 WORKDIR /repo
 
+# ---------------------------------------------------------------------
+# Plant /cache/pacman/pkg at image build time.
+# ---------------------------------------------------------------------
+# devtools' `extra-x86_64-build` -> `arch-nspawn` resolves the host's
+# pacman `CacheDir` and bind-mounts the FIRST entry as RW into the
+# build chroot (devtools' arch-nspawn.in line 99). If we leave the
+# default `CacheDir = /var/cache/pacman/pkg/`, every pacman download
+# is written into the container's overlay and lost on container
+# recreation. The fix is to make the FIRST CacheDir under /cache
+# (which is host-bind-mounted at runtime) and ensure the directory
+# exists with the right ownership and mode. See
+# scripts/pacman-cache-config.sh + init.sh for the runtime half —
+# here we just pre-create the path so `pacman -Sy` during the
+# archlinux:latest keying step (line 109 below) has a CacheDir to
+# write into, AND so the overlay layer has the directory shape
+# we expect before the host bind-mount replaces it.
+#
+# Mode 0755 (not 0777): narrowest mode that lets both root
+# (initial pacstrap during extra-x86_64-build) and `builder`
+# (the makepkg process inside the chroot) write here. Owner
+# builder:builder matches build.sh:59's existing /cache chown.
+# ---------------------------------------------------------------------
+RUN mkdir -p /cache/pacman/pkg \
+ && chmod 0755 /cache /cache/pacman/pkg \
+ && chown builder:builder /cache /cache/pacman/pkg
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY build.sh      /usr/local/bin/build.sh
 COPY init.sh       /usr/local/bin/init.sh
 COPY update.sh     /usr/local/bin/update.sh
 COPY serve.sh      /usr/local/bin/serve.sh
 COPY run.sh        /usr/local/bin/run.sh
+COPY install-repo.sh /usr/local/bin/install-repo.sh
 COPY scripts/      /usr/local/lib/aur-forge/
 COPY cgi-bin/      /usr/lib/aur-forge/cgi-bin/
 COPY www/          /usr/share/aur-forge/www/
 COPY lighttpd.conf /etc/aur-forge/lighttpd.conf
+
+# lighttpd.conf aliases /install-repo.sh → /usr/share/aur-forge/www/
+# install-repo.sh. The COPY www/ above only plants the contents of
+# www/ at build time (which today is install.html + style.css only).
+# Symlink install-repo.sh into www/ from /usr/local/bin/ so the alias
+# resolves to the real client-side bootstrap script. A symlink rather
+# than a COPY keeps a single source of truth — editing
+# install-repo.sh in the repo and rebuilding the image immediately
+# serves the new version with no second copy to keep in sync.
+RUN ln -sf /usr/local/bin/install-repo.sh \
+           /usr/share/aur-forge/www/install-repo.sh
 
 # CSRF secret is NOT baked into the image. It's generated on first
 # container start by init.sh and persisted to /keys/csrf-secret (a

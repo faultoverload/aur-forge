@@ -4,15 +4,125 @@
 # on an existing keyring is a no-op.
 set -euo pipefail
 
+# Multi-candidate lib lookup (matches the pattern in update.sh).
+# init.sh is at /usr/local/bin/init.sh in production; lib-aur.sh
+# and the helpers below live at /usr/local/lib/aur-forge/. The
+# dev checkout puts them at scripts/, so try both. The same
+# SCRIPT_DIR_LIB satisfies both helpers as long as the lookup
+# finds any one of the two.
+SCRIPT_DIR_LIB=""
+for cand in \
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts" \
+    /usr/local/lib/aur-forge; do
+    if [[ -f "${cand}/pacman-cache-config.sh" ]] \
+       || [[ -f "${cand}/makepkg-jobs-config.sh" ]]; then
+        SCRIPT_DIR_LIB="$cand"
+        break
+    fi
+done
+if [[ -z "$SCRIPT_DIR_LIB" ]]; then
+    echo "[init] WARNING: no helper scripts found in any candidate path" >&2
+fi
+
+# shellcheck disable=SC1090
+. "${SCRIPT_DIR_LIB}/pacman-cache-config.sh" 2>/dev/null || true
+# shellcheck disable=SC1090
+. "${SCRIPT_DIR_LIB}/makepkg-jobs-config.sh" 2>/dev/null || true
+
 REPO_NAME="${REPO_NAME:-aur-forge}"
 REPO_OWNER="${REPO_OWNER:-faultoverload}"
 REPO_EMAIL="${REPO_EMAIL:-woodsyx@gmail.com}"
 GPG_KEY_NAME="${GPG_KEY_NAME:-aur-forge}"
 GPG_PASSPHRASE="${GPG_PASSPHRASE:-}"   # empty = unprotected key (homelab OK)
 
+# AUR fetch clone policy (consumed by scripts/aur-fetch-wrapper.sh
+# via the build pipeline). `discard` is the recommended default for
+# fresh nightly rebuilds: aur-fetch will reset any local commits
+# in the workdir and pin to upstream `master@{upstream}` rather than
+# attempting to merge / rebase. Operators raising this for ad-hoc
+# testing may use `merge` or `rebase`, but those can clobber an
+# operator's local notes and are explicitly NOT the default for
+# noninteractive nightly builds.
+AUR_FETCH_CLONE_POLICY="${AUR_FETCH_CLONE_POLICY:-discard}"
+case "${AUR_FETCH_CLONE_POLICY}" in
+    discard|merge|rebase|auto|reset) : ;;
+    *)
+        echo "[init] WARNING: AUR_FETCH_CLONE_POLICY='${AUR_FETCH_CLONE_POLICY}' is not one of discard|merge|rebase|auto|reset; falling back to discard" >&2
+        AUR_FETCH_CLONE_POLICY=discard ;;
+esac
+export AUR_FETCH_CLONE_POLICY
+
 export GNUPGHOME="/keys"
 mkdir -p /keys /repo /cache
 chmod 700 /keys
+
+# ---------------------------------------------------------------------
+# Make the pacman package cache persistent across container rebuilds.
+# ---------------------------------------------------------------------
+# The live baseline (2026-09-01) showed pacman-conf resolves
+# `CacheDir = /var/cache/pacman/pkg/` against the devtools-shipped
+# /usr/share/devtools/pacman.conf.d/extra.conf. That directory is
+# overlay (in-container), so every pacman download is lost on
+# container recreation. Fix: prepend `CacheDir = /cache/pacman/pkg/`
+# to the devtools config so arch-nspawn's first-cache-dir bind
+# (line 99 of devtools' arch-nspawn.in) points at host-backed
+# storage on the bind-mounted /cache volume.
+#
+# We install a tiny drop-in fragment under our own tree
+# (/usr/local/lib/aur-forge/pacman.d/) and add a single `Include`
+# line to extra.conf. That keeps our cache config isolated from
+# any future `pacman -Syu devtools` upgrade — the devtools
+# package will rewrite its extra.conf, but the Include we add is
+# idempotent and we re-install it on every container start.
+# ---------------------------------------------------------------------
+PACMAN_CACHE_DIR="${AUR_FORGE_PACMAN_CACHE_DIR:-/cache/pacman/pkg/}"
+PACMAN_DROPIN="${AUR_FORGE_PACMAN_DROPIN:-/usr/local/lib/aur-forge/pacman.d/00-cache.conf}"
+PACMAN_EXTRA_CONF="${AUR_FORGE_PACMAN_EXTRA_CONF:-/usr/share/devtools/pacman.conf.d/extra.conf}"
+
+mkdir -p "$PACMAN_CACHE_DIR"
+# 0755: writable by owner (builder, who runs makechrootpkg), r-x
+# for group/other. NO 0777 — that would be a clear regression;
+# 0755 is the narrowest mode that lets both root (initial pacstrap)
+# and `builder` (subsequent makechrootpkg) write into the dir.
+chmod 0755 "$PACMAN_CACHE_DIR"
+# Both root (initial chroot bootstrap) and the `builder` user
+# (who runs makepkg + extra-x86_64-build) need to write here.
+# root: rwx; builder: rwx; others: r-x. chown is idempotent.
+chown builder:builder "$PACMAN_CACHE_DIR" 2>/dev/null || true
+
+if [[ -n "$SCRIPT_DIR_LIB" ]] \
+   && declare -F write_pacman_cache_dropin >/dev/null 2>&1 \
+   && declare -F install_pacman_cache_include >/dev/null 2>&1; then
+    write_pacman_cache_dropin "$PACMAN_DROPIN" "$PACMAN_CACHE_DIR"
+    install_pacman_cache_include "$PACMAN_EXTRA_CONF" "$PACMAN_DROPIN"
+    echo "[init] pacman cache: ${PACMAN_CACHE_DIR} (persistent on /cache)"
+else
+    echo "[init] WARNING: pacman cache drop-in helper unavailable — cache stays ephemeral" >&2
+fi
+
+# ---------------------------------------------------------------------
+# Materialize a bounded makepkg drop-in so compile and compression
+# parallelism stay inside the 4 GiB container budget.
+# ---------------------------------------------------------------------
+# The container's mem_limit is 4g; the host has 64 GiB / 8 vCPU. With
+# the devtools-shipped /etc/makepkg.conf, MAKEFLAGS/NPROC are
+# commented (=> -j1) and COMPRESSZST is unbounded `-T0` (=> all
+# cores). That desync is what blows past the 4g cgroup on the
+# compression burst. Default AUR_BUILD_JOBS=2 binds all three to
+# the same value. Validation happens in build.sh before the first
+# extra-x86_64-build call so bad env values fail fast.
+# ---------------------------------------------------------------------
+MAKEPKG_JOBS_DROPIN="${AUR_FORGE_MAKEPKG_JOBS_DROPIN:-/usr/local/lib/aur-forge/makepkg.d/00-jobs.conf}"
+if [[ -n "$SCRIPT_DIR_LIB" ]] \
+   && declare -F write_makepkg_jobs_dropin >/dev/null 2>&1; then
+    if write_makepkg_jobs_dropin "$MAKEPKG_JOBS_DROPIN"; then
+        echo "[init] makepkg jobs drop-in: ${MAKEPKG_JOBS_DROPIN} (AUR_BUILD_JOBS=${AUR_BUILD_JOBS:-default})"
+    else
+        echo "[init] WARNING: makepkg jobs drop-in not written (validation failed)" >&2
+    fi
+else
+    echo "[init] WARNING: makepkg jobs helper unavailable — staying at devtools defaults (-j1, -T0)" >&2
+fi
 
 KEY_FPR_FILE="/keys/trusted-key.fpr"
 
@@ -150,7 +260,7 @@ if [[ "$REPO_NAME" != "custom" && ! -f "$LEGACY_MARKER" \
             rm -f aur-forge.db* aur-forge.files*
             for pkg in *.pkg.tar.zst; do
                 [[ -f "$pkg" ]] || continue
-                repo-add --sign --key "$FPR" \
+                repo-add -w --prevent-downgrade --sign --key "$FPR" \
                     aur-forge.db.tar.zst "$pkg"
             done
             echo "[init] regenerated aur-forge.db with $(ls aur-forge.db* 2>/dev/null | wc -l) entries"

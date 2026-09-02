@@ -18,8 +18,24 @@ services:
       REPO_NAME: custom
       REPO_OWNER: faultoverload
       REPO_EMAIL: woodsyx@gmail.com
+      # AUR_BUILD_JOBS bounds compile and compression parallelism.
+      # Default 2 fits the 4g container mem_limit; raise only if the
+      # compose mem_limit is also raised. The helper
+      # scripts/makepkg-jobs-config.sh rejects anything outside the
+      # [1, MAX_AUR_BUILD_JOBS=8] range before any build starts.
+      AUR_BUILD_JOBS: "2"
+      MAX_AUR_BUILD_JOBS: "8"
     volumes:
       # Bind-mount these from the host so state survives container rebuilds.
+      # /repo     served output: x86_64/*.pkg.tar.zst, *.db, *.sig
+      # /cache    three distinct subtrees under it:
+      #             /cache/work              AUR source tarballs (makepkg SRCDEST)
+      #             /cache/work-quarantine   quarantined cloned trees (gate deny)
+      #             /cache/pacman/pkg        official Arch package cache (pacman
+      #                                      CacheDir; persists across builds)
+      #           The clean chroot itself lives at /var/lib/archbuild
+      #           (in-container; rebuilt every `extra-x86_64-build -c`).
+      # /keys     GPG keyring (survives container rebuilds)
       - ./pkglist.txt:/pkglist:ro
       - aur-forge-repo:/repo
       - aur-forge-cache:/cache
