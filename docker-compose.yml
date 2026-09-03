@@ -22,8 +22,13 @@ services:
     hostname: aur-forge
     healthcheck:
       test:
+        # Probe /aur-forge.db.tar.zst inside the repo. The directory URL
+        # (/aur-forge.x86_64/) returns 403 because lighttpd has dir-listing
+        # disabled and no index.html; a real package file always returns 200
+        # once a build has completed. init.sh regenerates this db on every
+        # container start, so its presence also implies init succeeded.
         - CMD-SHELL
-        - curl -fsS http://127.0.0.1:8080/aur-forge.x86_64/ -o /dev/null || exit 1
+        - curl -fsS http://127.0.0.1:8080/aur-forge.x86_64/aur-forge.db.tar.zst -o /dev/null || exit 1
       timeout: 10s
       interval: 1m
       retries: 3

@@ -179,7 +179,13 @@ RUN pacman -Sy --noconfirm --needed systemd-sysvcompat dbus \
 # container kept hanging at "Please configure the system!" on first boot.
 # Manual symlinks to /dev/null work regardless of unit installation order.
  && ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service \
- && ln -sf /dev/null /etc/systemd/system/systemd-remount-fs.service \
+# Don't /dev/null-mask systemd-remount-fs — local-fs.target pulls it in and
+# an empty unit file there breaks the boot chain. Disable it cleanly via a
+# drop-in that overrides ConditionPathExists; this leaves the unit defined
+# but inert.
+ && mkdir -p /etc/systemd/system/systemd-remount-fs.service.d \
+ && printf '[Unit]\nConditionPathExists=!/this-path-will-never-exist\n[Service]\nExecStart=\nType=oneshot\n' \
+        > /etc/systemd/system/systemd-remount-fs.service.d/override.conf \
 # Pre-seed /etc/machine-id so systemd's ConditionFirstBoot=yes check fails
 # on every start. The previous setup relied on systemd to generate this on
 # first boot — but "first boot" triggers firstboot.service, which we're
