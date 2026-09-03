@@ -92,17 +92,19 @@ done < <(query_aur_versions "${PKGS[@]}")
 # PKGS array as the name list to disambiguate hyphenated names.
 # ---------------------------------------------------------------------
 declare -A REPO_VER
-PKGS_STR="${PKGS[*]}"
-# Export PKGS as a space-separated string for lib-aur.sh::parse_local_versions.
-# We deliberately switch types here — update.sh uses PKGS as an array, but
-# lib-aur.sh accepts either form and we pass the string for the helper.
-# shellcheck disable=SC2178
-export PKGS="$PKGS_STR"
+# parse_local_versions in lib-aur.sh expects PKGS as a *scalar* (space-
+# separated string) — its `declare -p PKGS` check explicitly excludes the
+# array form. But update.sh itself iterates PKGS as an array in phase 3,
+# so we can't just overwrite it with a string (which would destroy the
+# array for the for-loop below). Solution: pass the scalar via a
+# dedicated PKGS_CSV env var that parse_local_versions reads, leaving
+# the PKGS array untouched. parse_local_versions already handles the
+# "no PKGS env" case via its [[ -n "${PKGS[*]:-}" ]] test, so we feed it
+# by exporting PKGS as the scalar *only* for the helper subshell.
 while IFS=$'\t' read -r name ver; do
     [[ -z "$name" ]] && continue
     REPO_VER["$name"]="$ver"
-done < <(parse_local_versions "$REPO_DIR")
-unset PKGS
+done < <(PKGS="${PKGS[*]}" parse_local_versions "$REPO_DIR")
 
 # ---------------------------------------------------------------------
 # Phase 3: build the rebuild list.
