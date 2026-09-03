@@ -42,33 +42,43 @@ if ! csrf_token_validate "$csrf"; then
     exit 0
 fi
 
-# Background-spawn update.sh. setid puts it in its own process group so
-# SIGTERM to the CGI doesn't kill the build.
+# Background-spawn update.sh. setsid puts it in its own process group so
+# SIGTERM to the CGI doesn't kill the build; nohup makes it ignore SIGHUP.
 LOG_TAG="[aur-forge-check $(date -u +%FT%TZ)]"
 # IMPORTANT: invoke bash by its real path. The Arch base image ships bash
 # at /usr/bin/bash; there is NO bash at /usr/local/bin/bash. Calling the
 # wrong path produces a silent nohup error and the build never runs.
 #
-# Log routing: we previously wrote only to /var/log/aur-forge-check.log
-# (which was never created in the image), so logs went nowhere and the
-# file redirect silently failed. Now we tee to BOTH:
-#   - /var/log/aur-forge-check.log  (operators with shell access)
-#   - stdout (lighttpd's stdout → systemd journal → docker logs)
-# That way both `docker logs aur-forge` and reading the file show the
-# same build progress. The build log dir is created here so the file
-# redirect never fails.
+# Log routing: we write the build's output to BOTH destinations:
+#   1. $LOG_FILE (for operators with shell access)
+#   2. PID 1's stdout (which is what `docker logs` captures)
+#
+# Writing to PID 1's stdout is done via a process substitution + tee that
+# forks /proc/1/fd/1 (the container's stdout). Without this, nohup
+# detaches the build from lighttpd's stdout AND inherits nohup's default
+# of redirecting stdout to nohup.out — so logs go nowhere visible. The
+# previous "echo >&2" attempt only worked when the build happened to run
+# in the same session as lighttpd, which is unreliable under setsid.
+#
+# The log directory is created here so the file redirect never fails on
+# the very first invocation after an image rebuild.
 mkdir -p /var/log/aur-forge-check
 LOG_FILE="/var/log/aur-forge-check/check.log"
-setsid nohup /usr/bin/bash -c "echo '${LOG_TAG} starting update.sh'; /usr/local/bin/update.sh" \
-    >>"$LOG_FILE" 2>&1 < /dev/null &
-spawn_pid=$!
 
-# Also announce the start to the container's stdout so `docker logs`
-# surfaces it even before update.sh emits its first line.
-echo "${LOG_TAG} starting update.sh (pid=${spawn_pid}, log=${LOG_FILE})" >&2
+# Wrap in bash -c so the LOG_TAG+startup echo go through the same
+# pipeline as update.sh output. Process substitution forks tee, which
+# writes to both $LOG_FILE and /proc/1/fd/1 in parallel.
+setsid nohup /usr/bin/bash -c "
+    echo '${LOG_TAG} starting update.sh'
+    /usr/local/bin/update.sh
+    rc=\$?
+    echo \"${LOG_TAG} update.sh finished with rc=\${rc}\"
+    exit \${rc}
+" > >(/usr/bin/tee -a "$LOG_FILE" > /proc/1/fd/1) 2> >(/usr/bin/tee -a "$LOG_FILE" > /proc/1/fd/1) < /dev/null &
+spawn_pid=$!
 
 cgi_send_header
 cgi_html_doc "check triggered" "<h1>Build check queued</h1>
-<div class=\"notice notice-ok\">spawned update.sh as PID ${spawn_pid}; logging to <code>${LOG_FILE}</code> and the container's stdout. Redirecting back to status in 3 seconds&hellip;</div>
+<div class=\"notice notice-ok\">spawned update.sh as PID ${spawn_pid}; logging to <code>${LOG_FILE}</code> and the container's stdout (<code>docker logs aur-forge</code>). Redirecting back to status in 3 seconds&hellip;</div>
 <script>setTimeout(function(){window.location.href='/';}, 3000);</script>
 <p><a href=\"/\">&larr; Back to status page</a></p>"
