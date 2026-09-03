@@ -171,7 +171,7 @@ COPY lighttpd.conf /etc/aur-forge/lighttpd.conf
 # the container doesn't provide. Failures here are non-fatal — the
 # `|| true` lets the build proceed even if a unit name changes in
 # a future systemd version.
-RUN pacman -S --noconfirm --needed systemd-sysvcompat dbus \
+RUN pacman -Sy --noconfirm --needed systemd-sysvcompat dbus \
 # Mask systemd-firstboot + systemd-remount-fs by linking them to /dev/null.
 # `systemctl mask` is unreliable during `docker build` because there's no
 # running systemd daemon to talk to and unit files may not be installed yet
