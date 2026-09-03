@@ -1,0 +1,63 @@
+# Production deployment for the 24/7 aur-forge service.
+# The image is expected to be built/tagged locally as localhost/aur-forge:latest.
+name: aur-forge
+
+services:
+  aur-forge:
+    cap_add:
+      - SYS_ADMIN
+      - MKNOD
+    cgroup: host
+    command:
+      - run
+    container_name: aur-forge
+    environment:
+      AUR_BUILD_JOBS: "4"
+      MAX_AUR_BUILD_JOBS: "8"
+      NIGHTLY_AT: "03:00"
+      REPO_EMAIL: woodsyx@gmail.com
+      REPO_NAME: aur-forge
+      REPO_OWNER: faultoverload
+      TZ: America/New_York
+    hostname: aur-forge
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://127.0.0.1:8080/aur-forge.x86_64/ -o /dev/null || exit 1
+      timeout: 10s
+      interval: 1m
+      retries: 3
+      start_period: 5m
+    image: localhost/aur-forge:latest
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.aur-forge.entrypoints: websecure
+      traefik.http.routers.aur-forge.middlewares: internal-only@file
+      traefik.http.routers.aur-forge.rule: Host(`aur-forge.gateslab.win`)
+      traefik.http.services.aur-forge.loadbalancer.server.port: "8080"
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      internal_network: null
+    pull_policy: never
+    restart: unless-stopped
+    security_opt:
+      - apparmor=unconfined
+    stop_grace_period: 1m15s
+    tty: true
+    volumes:
+      - /opt/docker/data/aur-forge/repo:/repo
+      - /opt/docker/data/aur-forge/cache:/cache
+      - /opt/docker/data/aur-forge/keys:/keys
+      - /opt/docker/data/aur-forge/approvals:/approvals
+      - /opt/docker/data/aur-forge/pkglist.txt:/pkglist:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - /run:/run
+
+networks:
+  internal_network:
+    name: internal_network
+    external: true
