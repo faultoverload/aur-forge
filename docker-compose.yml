@@ -55,7 +55,6 @@ services:
       - /opt/docker/data/aur-forge/approvals:/approvals
       - /opt/docker/data/aur-forge/pkglist.txt:/pkglist:ro
       - /sys/fs/cgroup:/sys/fs/cgroup
-      - /run:/run
 
 networks:
   internal_network:
