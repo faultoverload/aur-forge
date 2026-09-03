@@ -172,10 +172,21 @@ COPY lighttpd.conf /etc/aur-forge/lighttpd.conf
 # `|| true` lets the build proceed even if a unit name changes in
 # a future systemd version.
 RUN pacman -S --noconfirm --needed systemd-sysvcompat dbus \
- && systemctl mask \
-        systemd-firstboot.service \
-        systemd-remount-fs.service \
- || true
+# Mask systemd-firstboot + systemd-remount-fs by linking them to /dev/null.
+# `systemctl mask` is unreliable during `docker build` because there's no
+# running systemd daemon to talk to and unit files may not be installed yet
+# at this layer — the previous attempt silently failed (|| true) and the
+# container kept hanging at "Please configure the system!" on first boot.
+# Manual symlinks to /dev/null work regardless of unit installation order.
+ && ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service \
+ && ln -sf /dev/null /etc/systemd/system/systemd-remount-fs.service \
+# Pre-seed /etc/machine-id so systemd's ConditionFirstBoot=yes check fails
+# on every start. The previous setup relied on systemd to generate this on
+# first boot — but "first boot" triggers firstboot.service, which we're
+# now masking, which is a chicken-and-egg that left the container wedged.
+# systemd-machine-id-setup is a no-op if the file already exists, so this
+# is safe across rebuilds. init.sh's later call becomes a no-op too.
+ && systemd-machine-id-setup
 
 COPY aur-forge.service /etc/systemd/system/aur-forge.service
 RUN systemctl enable aur-forge.service
