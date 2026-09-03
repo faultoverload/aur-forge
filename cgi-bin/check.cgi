@@ -43,18 +43,32 @@ if ! csrf_token_validate "$csrf"; then
 fi
 
 # Background-spawn update.sh. setid puts it in its own process group so
-# SIGTERM to the CGI doesn't kill the build. Output is captured to the
-# container's stdout/stderr (which systemd or docker logs will pick up).
+# SIGTERM to the CGI doesn't kill the build.
 LOG_TAG="[aur-forge-check $(date -u +%FT%TZ)]"
 # IMPORTANT: invoke bash by its real path. The Arch base image ships bash
 # at /usr/bin/bash; there is NO bash at /usr/local/bin/bash. Calling the
 # wrong path produces a silent nohup error and the build never runs.
+#
+# Log routing: we previously wrote only to /var/log/aur-forge-check.log
+# (which was never created in the image), so logs went nowhere and the
+# file redirect silently failed. Now we tee to BOTH:
+#   - /var/log/aur-forge-check.log  (operators with shell access)
+#   - stdout (lighttpd's stdout → systemd journal → docker logs)
+# That way both `docker logs aur-forge` and reading the file show the
+# same build progress. The build log dir is created here so the file
+# redirect never fails.
+mkdir -p /var/log/aur-forge-check
+LOG_FILE="/var/log/aur-forge-check/check.log"
 setsid nohup /usr/bin/bash -c "echo '${LOG_TAG} starting update.sh'; /usr/local/bin/update.sh" \
-    >/var/log/aur-forge-check.log 2>&1 < /dev/null &
+    >>"$LOG_FILE" 2>&1 < /dev/null &
 spawn_pid=$!
+
+# Also announce the start to the container's stdout so `docker logs`
+# surfaces it even before update.sh emits its first line.
+echo "${LOG_TAG} starting update.sh (pid=${spawn_pid}, log=${LOG_FILE})" >&2
 
 cgi_send_header
 cgi_html_doc "check triggered" "<h1>Build check queued</h1>
-<div class=\"notice notice-ok\">spawned update.sh as PID ${spawn_pid}; logging to <code>/var/log/aur-forge-check.log</code>. Redirecting back to status in 3 seconds&hellip;</div>
+<div class=\"notice notice-ok\">spawned update.sh as PID ${spawn_pid}; logging to <code>${LOG_FILE}</code> and the container's stdout. Redirecting back to status in 3 seconds&hellip;</div>
 <script>setTimeout(function(){window.location.href='/';}, 3000);</script>
 <p><a href=\"/\">&larr; Back to status page</a></p>"

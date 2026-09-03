@@ -205,7 +205,12 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh \
     && ln -sf /usr/local/lib/aur-forge/approval-store.sh      /usr/local/bin/approval-store.sh \
     && ln -sf /usr/local/lib/aur-forge/srcinfo-diff.sh        /usr/local/bin/srcinfo-diff.sh \
     && ln -sf /usr/local/lib/aur-forge/open-quarantine-issue.sh /usr/local/bin/open-quarantine-issue.sh \
-    && ln -sf /usr/local/lib/aur-forge/drain-quarantine.sh    /usr/local/bin/drain-quarantine.sh
+    && ln -sf /usr/local/lib/aur-forge/drain-quarantine.sh    /usr/local/bin/drain-quarantine.sh \
+# Pre-create the log directories used by lighttpd (error.log, access.log)
+# and by check.cgi's backgrounded build (check.log). Without these, the
+# file redirects in lighttpd.conf and check.cgi fail on first write and
+# the build silently never runs.
+    && mkdir -p /var/log/aur-forge-lighttpd /var/log/aur-forge-check
 
 # lighttpd serves on 8080 internally; Traefik in front publishes 443.
 EXPOSE 8080
