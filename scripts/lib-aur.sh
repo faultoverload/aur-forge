@@ -100,6 +100,16 @@ query_aur_versions() {
     done
 }
 
+# _ver_gt A B — true if version A is newer than B. Uses pacman's vercmp
+# when present (the container), else `sort -V` (dev hosts without pacman).
+_ver_gt() {
+    if command -v vercmp >/dev/null 2>&1; then
+        (( $(vercmp "$1" "$2") > 0 ))
+    else
+        [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+    fi
+}
+
 # ----------------------------------------------------------------------
 # parse_local_versions [repo_dir]
 # Scans <repo_dir>/*.pkg.tar.zst and emits "name<TAB>version" on stdout.
@@ -117,6 +127,10 @@ parse_local_versions() {
     [[ -d "$repo_dir" ]] || return 0
     shopt -s nullglob
     local f
+    # Highest local version per package name (a repo dir can hold several
+    # versions of one package until pruned).
+    local -A _best=()
+    local -a _order=()
     for f in "$repo_dir"/*.pkg.tar.zst; do
         local base="${f##*/}"
         local noarch="${base%-x86_64.pkg.tar.zst}"
@@ -133,12 +147,24 @@ parse_local_versions() {
                 # shellcheck disable=SC2206  # word-split is intentional
                 _known_pkgs=(${PKGS})
             fi
-            local pname
+            local pname rest
             for pname in "${_known_pkgs[@]}"; do
-                if [[ "$noarch" == "${pname}-"* ]]; then
-                    printf '%s\t%s\n' "$pname" "${noarch#"${pname}"-}"
-                    break
+                [[ "$noarch" == "${pname}-"* ]] || continue
+                rest="${noarch#"${pname}"-}"
+                # What follows "<pname>-" must be EXACTLY [epoch:]pkgver-pkgrel
+                # (pkgver has no '-'; pkgrel is N or N.M). A bare prefix test
+                # also matched sibling packages ("yay" vs "yay-bin-13.1.0-1",
+                # "hermes-agent" vs "hermes-agent-desktop-...", "-debug"
+                # splits), reporting a bogus version and making update.sh
+                # rebuild them every night.
+                [[ "$rest" =~ ^([0-9]+:)?[^-]+-[0-9]+(\.[0-9]+)?$ ]] || continue
+                if [[ -z "${_best[$pname]:-}" ]]; then
+                    _order+=("$pname")
+                    _best[$pname]="$rest"
+                elif _ver_gt "$rest" "${_best[$pname]}"; then
+                    _best[$pname]="$rest"
                 fi
+                break
             done
         else
             # Best-effort split: peel off the last '-' segment as the
@@ -148,6 +174,10 @@ parse_local_versions() {
             ver="${noarch##*-}"
             printf '%s\t%s\n' "$name" "$ver"
         fi
+    done
+    local n
+    for n in "${_order[@]}"; do
+        printf '%s\t%s\n' "$n" "${_best[$n]}"
     done
 }
 
