@@ -139,6 +139,7 @@ COPY run.sh        /usr/local/bin/run.sh
 COPY scripts/      /usr/local/lib/aur-forge/
 COPY cgi-bin/      /usr/lib/aur-forge/cgi-bin/
 COPY www/          /usr/share/aur-forge/www/
+COPY validpgp-keys/ /usr/share/aur-forge/validpgp-keys/
 COPY lighttpd.conf /etc/aur-forge/lighttpd.conf
 
 # CSRF secret is NOT baked into the image. It's generated on first

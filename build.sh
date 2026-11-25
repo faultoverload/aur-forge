@@ -17,7 +17,7 @@ source "${SCRIPT_DIR}/srcinfo-diff.sh"
 # shellcheck source=scripts/open-quarantine-issue.sh
 source "${SCRIPT_DIR}/open-quarantine-issue.sh"
 
-REPO_NAME="${REPO_NAME:-custom}"
+REPO_NAME="${REPO_NAME:-aur-forge}"
 REPO_OWNER="${REPO_OWNER:-faultoverload}"
 REPO_EMAIL="${REPO_EMAIL:-woodsyx@gmail.com}"
 GPG_PASSPHRASE="${GPG_PASSPHRASE:-}"
@@ -437,6 +437,43 @@ FPR="$(gpg --list-secret-keys --with-colons "${REPO_EMAIL}" | awk -F: '/^fpr:/ {
 echo "[build] signing key: $FPR"
 
 # Read the package list, strip comments / blanks.
+# ---------------------------------------------------------------------
+# Local repo inside the build chroot.
+# ---------------------------------------------------------------------
+# AUR packages routinely depend on OTHER AUR packages (e.g.
+# hermes-agent-desktop -> hermes-agent). The devtools chroot only knows
+# [core]/[extra], so `makepkg --syncdeps` dies with "target not found:
+# hermes-agent>=X". Fix: expose our own repo to the chroot as a read-only
+# file:// repository, so anything we already built is resolvable. Order
+# the pkglist so dependencies come first.
+#
+# archbuild (devtools) picks up two drop-ins that we generate here:
+#   * /usr/share/devtools/pacman.conf.d/extra-x86_64.conf  (overrides
+#     extra.conf; used for `pacman -Syuu` in the clean chroot)
+#   * /usr/share/devtools/mount.d/x86_64  ("ro <dir>" -> makechrootpkg -D)
+# The stanza is only emitted once the repo db exists — a file:// repo
+# with no db makes `pacman -Sy` fail and takes the whole build with it.
+# SigLevel=Never: the repo is local, bind-mounted read-only and written
+# only by this script; the chroot keyring does not hold our signing key.
+configure_chroot_local_repo() {
+    local conf_dir="${DEVTOOLS_CONF_DIR:-/usr/share/devtools}"
+    local conf="${conf_dir}/pacman.conf.d/extra-x86_64.conf"
+    local mounts="${conf_dir}/mount.d/x86_64"
+    local base="${conf_dir}/pacman.conf.d/extra.conf"
+    if [[ -s "${REPO_DIR}/${REPO_NAME}.db" && -f "$base" ]]; then
+        mkdir -p "${conf_dir}/mount.d"
+        {
+            cat "$base"
+            printf '\n[%s]\nSigLevel = Never\nServer = file://%s\n' "$REPO_NAME" "$REPO_DIR"
+        } > "$conf"
+        printf 'ro %s\n' "$REPO_DIR" > "$mounts"
+        echo "[build] chroot local repo enabled: [${REPO_NAME}] file://${REPO_DIR}"
+    else
+        rm -f "$conf" "$mounts"
+        echo "[build] chroot local repo disabled (no ${REPO_NAME}.db yet)"
+    fi
+}
+
 mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$PKGLIST")
 echo "[build] $((${#PKGS[@]})) package(s) in pkglist"
 
@@ -504,6 +541,9 @@ for pkg in "${PKGS[@]}"; do
     # check() on packages that have it, prefer MAKEFLAGS="-nocheck"
     # or a makepkg.conf drop-in rather than threading an unsupported
     # flag through every invocation.
+    # Re-evaluate every iteration: the previous package may have just
+    # created the db (or added a dependency this one needs).
+    configure_chroot_local_repo
     if ! sudo -u builder extra-x86_64-build 2>/tmp/build.err; then
         echo "[build] FAILED to build $pkg:" >&2
         tail -50 /tmp/build.err >&2

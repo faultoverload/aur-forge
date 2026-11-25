@@ -268,6 +268,44 @@ docker compose -f /opt/docker/compose/bigballs/production/aur-forge/docker-compo
 
 …or trigger the Komodo procedure `aur-forge-build` from the UI.
 
+### AUR packages that depend on other AUR packages
+
+Packages are built in `pkglist.txt` order, and the finished repo is exposed
+to the build chroot as a read-only `file://` repository (see
+`configure_chroot_local_repo` in `build.sh`). So list a dependency **before**
+the package that needs it, e.g.:
+
+```
+hermes-agent            # AUR dependency first ...
+hermes-agent-desktop    # ... depends on hermes-agent>=X
+```
+
+Without this, `makepkg --syncdeps` fails with `target not found: hermes-agent>=X`
+because the chroot only knows `[core]`/`[extra]`.
+
+### Packages with PGP-signed sources (`validpgpkeys=`)
+
+Source signatures are verified outside the chroot as the `builder` user, so
+the upstream signing key must be in builder's keyring or the build fails with
+`unknown public key <id>`. Commit the key as
+`validpgp-keys/<FULL-FINGERPRINT>.asc`; `init.sh` imports every file on each
+container start and **refuses any file whose primary fingerprint differs from
+its name**.
+
+```bash
+FPR=<40-hex fingerprint from the PKGBUILD validpgpkeys=()>
+curl -s "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${FPR}" -o validpgp-keys/${FPR}.asc
+gpg --show-keys --with-colons validpgp-keys/${FPR}.asc | awk -F: '$1=="fpr"{print $10; exit}'   # must print $FPR
+```
+
+### Environment reaches the service via `PassEnvironment=`
+
+The container runs systemd as PID 1, and systemd services do **not** inherit
+the container's environment. `aur-forge.service` therefore lists the settings
+it needs (`REPO_NAME`, `GITHUB_TOKEN`, `GITHUB_REPO`, `TZ`, `NIGHTLY_AT`, …) in
+`PassEnvironment=`. A new setting read by `run.sh`/`build.sh`/`update.sh` must
+be added to that line, or it silently falls back to its default.
+
 ## Nightly upstream-version check
 
 `aur-forge` ships an `update` subcommand that:
