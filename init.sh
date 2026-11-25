@@ -52,6 +52,48 @@ fi
 gpg --export --armor "${REPO_EMAIL}" > /keys/aur-forge.pub
 chmod 0644 /keys/aur-forge.pub
 
+# ---------------------------------------------------------------------
+# Pre-seed upstream PGP keys for AUR packages with signed sources.
+# ---------------------------------------------------------------------
+# Some PKGBUILDs ship `source=(...?signed)` + `validpgpkeys=(<FPR>)`
+# (e.g. neofetch -> Dylan Araps). makechrootpkg verifies sources OUTSIDE
+# the chroot as the `builder` user (`makepkg --verifysource`), against
+# builder's own keyring (~builder/.gnupg) — NOT /keys (that is our
+# signing key) and NOT the chroot's pacman keyring. If the key is
+# missing the build dies with "unknown public key <id>". builder's HOME
+# lives on the container's overlay, so the keys must be re-imported on
+# every start; imports are idempotent.
+#
+# Keys are committed to the repo as validpgp-keys/<FULL-FINGERPRINT>.asc
+# (copied to /usr/share/aur-forge/validpgp-keys by the Dockerfile). The
+# fingerprint in the file name is the trust anchor: a file is imported
+# only if its primary key fingerprint equals its name, so a swapped or
+# corrupted .asc is refused rather than silently trusted. To add one:
+#   curl -s 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x<FPR>' \
+#        -o validpgp-keys/<FPR>.asc     # FPR from the PKGBUILD validpgpkeys
+VALIDPGP_DIR="${VALIDPGP_DIR:-/usr/share/aur-forge/validpgp-keys}"
+if [[ -d "$VALIDPGP_DIR" ]]; then
+    BUILDER_GNUPG="/home/builder/.gnupg"
+    install -d -m 700 -o builder -g builder "$BUILDER_GNUPG"
+    shopt -s nullglob
+    for asc in "$VALIDPGP_DIR"/*.asc; do
+        want="$(basename "$asc" .asc)"
+        have="$(gpg --batch --show-keys --with-colons "$asc" 2>/dev/null \
+                | awk -F: '$1=="fpr" {print $10; exit}')"
+        if [[ -z "$have" || "$have" != "$want" ]]; then
+            echo "[init] REFUSING $asc: primary fingerprint '${have:-<none>}' != file name '$want'" >&2
+            continue
+        fi
+        if sudo -u builder env -u GNUPGHOME gpg --homedir "$BUILDER_GNUPG" \
+               --batch --quiet --import "$asc" 2>/dev/null; then
+            echo "[init] seeded upstream PGP key $want into builder keyring"
+        else
+            echo "[init] WARNING: failed to import $asc" >&2
+        fi
+    done
+    shopt -u nullglob
+fi
+
 # systemd-nspawn (called by arch-nspawn inside extra-x86_64-build)
 # refuses to start without /etc/machine-id. archlinux:latest doesn't
 # ship one. Idempotent: systemd-machine-id-setup is a no-op if the

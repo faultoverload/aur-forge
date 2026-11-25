@@ -301,6 +301,77 @@ else
 fi
 
 echo
+echo "=== runtime env / local chroot repo / pre-seeded PGP keys ==="
+# 1. systemd does not hand the container env to services: the unit must
+#    forward the settings the scripts read.
+for v in REPO_NAME GITHUB_TOKEN TZ NIGHTLY_AT GITHUB_REPO; do
+    if grep -E '^PassEnvironment=' "${REPO_ROOT}/aur-forge.service" | grep -qw "$v"; then
+        pass "aur-forge.service PassEnvironment forwards $v"
+    else
+        fail "aur-forge.service PassEnvironment is missing $v"
+    fi
+done
+
+# 2. build.sh must agree with update.sh/init.sh/serve.sh on REPO_NAME's default.
+if grep -q 'REPO_NAME="${REPO_NAME:-aur-forge}"' "${REPO_ROOT}/build.sh"; then
+    pass "build.sh REPO_NAME defaults to aur-forge"
+else
+    fail "build.sh REPO_NAME default is not aur-forge (writes to the wrong repo dir)"
+fi
+
+# 3. configure_chroot_local_repo: enabled only when the db exists.
+CHR_TMP="${TEST_TMP}/chroot-conf"
+mkdir -p "${CHR_TMP}/pacman.conf.d" "${CHR_TMP}/repo/aur-forge.x86_64"
+printf '[core]\nInclude = /etc/pacman.d/mirrorlist\n[extra]\nInclude = /etc/pacman.d/mirrorlist\n' \
+    > "${CHR_TMP}/pacman.conf.d/extra.conf"
+sed -n '/^configure_chroot_local_repo()/,/^}/p' "${REPO_ROOT}/build.sh" > "${CHR_TMP}/fn.sh"
+run_cfg() {
+    ( DEVTOOLS_CONF_DIR="${CHR_TMP}" REPO_NAME=aur-forge REPO_DIR="${CHR_TMP}/repo/aur-forge.x86_64" \
+      bash -c 'source "$1"; configure_chroot_local_repo' _ "${CHR_TMP}/fn.sh" >/dev/null )
+}
+run_cfg
+if [[ ! -e "${CHR_TMP}/pacman.conf.d/extra-x86_64.conf" && ! -e "${CHR_TMP}/mount.d/x86_64" ]]; then
+    pass "no local-repo drop-ins while the db does not exist"
+else
+    fail "local-repo drop-ins written although the db does not exist"
+fi
+touch "${CHR_TMP}/repo/aur-forge.x86_64/aur-forge.db"; echo x > "${CHR_TMP}/repo/aur-forge.x86_64/aur-forge.db"
+run_cfg
+if grep -q '^\[aur-forge\]$' "${CHR_TMP}/pacman.conf.d/extra-x86_64.conf" \
+   && grep -q "^Server = file://${CHR_TMP}/repo/aur-forge.x86_64\$" "${CHR_TMP}/pacman.conf.d/extra-x86_64.conf" \
+   && grep -q '^\[extra\]$' "${CHR_TMP}/pacman.conf.d/extra-x86_64.conf"; then
+    pass "local repo stanza appended after the stock extra.conf"
+else
+    fail "local repo stanza missing/malformed in extra-x86_64.conf"
+fi
+assert_eq "$(cat "${CHR_TMP}/mount.d/x86_64")" "ro ${CHR_TMP}/repo/aur-forge.x86_64" "mount.d/x86_64 binds the repo read-only"
+rm -f "${CHR_TMP}/repo/aur-forge.x86_64/aur-forge.db"
+run_cfg
+if [[ ! -e "${CHR_TMP}/pacman.conf.d/extra-x86_64.conf" && ! -e "${CHR_TMP}/mount.d/x86_64" ]]; then
+    pass "drop-ins are removed again when the db disappears"
+else
+    fail "stale local-repo drop-ins left behind"
+fi
+
+# 4. Pre-seeded PGP keys: file name must be the primary fingerprint.
+shopt -s nullglob
+asc_files=( "${REPO_ROOT}"/validpgp-keys/*.asc )
+shopt -u nullglob
+if [[ ${#asc_files[@]} -eq 0 ]]; then
+    fail "validpgp-keys/ contains no .asc files"
+fi
+for asc in "${asc_files[@]}"; do
+    want="$(basename "$asc" .asc)"
+    have="$(gpg --batch --show-keys --with-colons "$asc" 2>/dev/null | awk -F: '$1=="fpr" {print $10; exit}')"
+    assert_eq "$have" "$want" "validpgp-keys/$(basename "$asc") primary fingerprint matches file name"
+done
+if grep -q 'validpgp-keys' "${REPO_ROOT}/Dockerfile" && grep -q 'validpgp-keys' "${REPO_ROOT}/init.sh"; then
+    pass "Dockerfile copies and init.sh imports validpgp-keys"
+else
+    fail "validpgp-keys not wired into Dockerfile/init.sh"
+fi
+
+echo
 echo "=== summary ==="
 echo "passed: $PASS"
 echo "failed: $FAIL"

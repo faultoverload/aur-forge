@@ -23,6 +23,14 @@ Type=simple
 # direct children of the bash process, not separate units. This
 # preserves the original 24/7 single-PID-group design.
 ExecStart=/usr/local/bin/run.sh
+# systemd units do NOT inherit the container's environment (PID 1's env
+# is only visible to the manager, not to the services it starts). Without
+# this line run.sh / build.sh / update.sh silently fall back to their
+# built-in defaults: REPO_NAME, GITHUB_TOKEN (quarantine Issues), TZ and
+# NIGHTLY_AT set in compose never reach them. PassEnvironment= forwards
+# the named variables from the manager's environment; names that are
+# unset are skipped, so this is safe for optional settings.
+PassEnvironment=REPO_NAME REPO_OWNER REPO_EMAIL GITHUB_REPO GITHUB_TOKEN TZ NIGHTLY_AT PORT GPG_PASSPHRASE GPG_KEY_NAME STRICT_FIRST_BUILD
 # SIGTERM forward: run.sh's trap exits 0 within ~60s. After that
 # systemd treats it as a clean stop and restarts per policy.
 Restart=always
