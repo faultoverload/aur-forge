@@ -118,16 +118,17 @@ scheduler_loop() {
     echo "${LOG_TAG} [scheduler] starting; nightly at ${NIGHTLY_AT} (TZ=${TZ:-UTC})"
     while true; do
         # Compute seconds until next NIGHTLY_AT in container's TZ.
-        # `date` +%s gives UTC epoch; we need local epoch. Workaround:
-        # compute (next NIGHTLY_AT in local TZ) - now, both as UTC seconds.
-        now_epoch="$(date -u +%s)"
-        target_epoch="$(TZ="${TZ:-UTC}" date -u -d "today ${NIGHTLY_AT}" +%s)"
+        # Epoch seconds are absolute, so no -u here: `date -u` makes GNU date
+        # ignore TZ when PARSING "today HH:MM" (it was read as UTC, so the
+        # nightly run fired at HH:MM UTC regardless of TZ).
+        now_epoch="$(date +%s)"
+        target_epoch="$(TZ="${TZ:-UTC}" date -d "today ${NIGHTLY_AT}" +%s)"
         # If target is already past today, push to tomorrow.
         if (( target_epoch <= now_epoch )); then
-            target_epoch="$(TZ="${TZ:-UTC}" date -u -d "tomorrow ${NIGHTLY_AT}" +%s)"
+            target_epoch="$(TZ="${TZ:-UTC}" date -d "tomorrow ${NIGHTLY_AT}" +%s)"
         fi
         sleep_for=$(( target_epoch - now_epoch ))
-        echo "${LOG_TAG} [scheduler] next run in ${sleep_for}s ($(TZ="${TZ:-UTC}" date -u -d "@${target_epoch}" '+%Y-%m-%d %H:%M:%S %Z'))"
+        echo "${LOG_TAG} [scheduler] next run in ${sleep_for}s ($(TZ="${TZ:-UTC}" date -d "@${target_epoch}" '+%Y-%m-%d %H:%M:%S %Z'))"
 
         # Sleep in 60-second chunks so SIGTERM is honored within ~1 min
         # instead of however long until next run.
