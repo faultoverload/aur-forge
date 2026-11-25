@@ -184,6 +184,24 @@ assert_eq "${parsed[1]}" "paru" "second parsed entry is paru"
 
 # ---------------------------------------------------------------
 echo
+echo "=== lib-aur.sh: parse_local_versions (sibling-name prefixes) ==="
+# ---------------------------------------------------------------
+# "yay" must not pick up yay-bin-/yay-debug-, "hermes-agent" must not pick up
+# hermes-agent-desktop-, and with several versions on disk the newest wins.
+plv="${TEST_TMP}/plv"; mkdir -p "$plv"
+for f in hermes-agent-0.23.4-1-x86_64 hermes-agent-desktop-0.23.4-1-x86_64 \
+         paru-bin-2.2.0-1-x86_64 paru-bin-2.2.1-1-x86_64 paru-bin-debug-2.2.1-1-x86_64 \
+         yay-13.1.0-1-x86_64 yay-bin-13.1.0-1-x86_64 yay-bin-debug-13.1.0-1-x86_64 yay-debug-13.1.0-1-x86_64 \
+         'trizen-1:1.68-1-any' neofetch-7.1.0-2-any; do
+    : > "${plv}/${f}.pkg.tar.zst"
+done
+plv_out="$(PKGS="neofetch hermes-agent hermes-agent-desktop paru-bin yay-bin trizen yay" parse_local_versions "$plv" | sort)"
+plv_want="$(printf '%s\n' $'hermes-agent\t0.23.4-1' $'hermes-agent-desktop\t0.23.4-1' $'neofetch\t7.1.0-2' \
+            $'paru-bin\t2.2.1-1' $'trizen\t1:1.68-1' $'yay\t13.1.0-1' $'yay-bin\t13.1.0-1' | sort)"
+assert_eq "$plv_out" "$plv_want" "parse_local_versions: one exact, newest version per package"
+
+# ---------------------------------------------------------------
+echo
 echo "=== add.cgi: spec cases ==="
 # ---------------------------------------------------------------
 
