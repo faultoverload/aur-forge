@@ -371,6 +371,20 @@ else
     fail "validpgp-keys not wired into Dockerfile/init.sh"
 fi
 
+# 5. Scheduler must honour TZ when parsing NIGHTLY_AT (`date -u -d` ignores TZ).
+if grep -nE 'date -u -d "(today|tomorrow) \$\{NIGHTLY_AT\}"' "${REPO_ROOT}/run.sh" >/dev/null; then
+    fail "run.sh parses NIGHTLY_AT with 'date -u' (TZ ignored -> fires in UTC)"
+else
+    pass "run.sh parses NIGHTLY_AT without 'date -u'"
+fi
+ny_epoch="$(TZ=America/New_York date -d 'today 03:00' +%s)"
+utc_epoch="$(TZ=UTC date -d 'today 03:00' +%s)"
+if (( ny_epoch != utc_epoch )); then
+    pass "03:00 America/New_York and 03:00 UTC resolve to different instants"
+else
+    fail "TZ not honoured when parsing NIGHTLY_AT"
+fi
+
 echo
 echo "=== summary ==="
 echo "passed: $PASS"
