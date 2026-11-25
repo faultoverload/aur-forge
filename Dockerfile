@@ -37,8 +37,11 @@ RUN sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf
 # git, base-devel — needed by every AUR build
 # jq, openssh, curl — gate pipeline (JSON manipulation + GitHub API)
 # make, gcc — needed by archcanary's PKGBUILD
-# pacutils, perl-json-xs — runtime deps of aurutils (AUR). Pre-install
-#   them here so the makepkg-as-tmpuser step below doesn't have to
+# pacutils, perl-json-xs, trurl — runtime deps of aurutils (AUR). trurl
+#   became a hard dependency in aurutils 21+ (it lives in [extra]); the
+#   sync DBs are wiped at the end of this layer, so `makepkg -s` on
+#   aurutils cannot resolve it later — it must be installed here.
+#   Pre-install them here so the makepkg-as-tmpuser step below doesn't have to
 #   resolve deps mid-build.
 #
 # NOTE: aurutils itself is AUR-only and is installed below via makepkg.
@@ -57,6 +60,7 @@ RUN pacman -Syu --noconfirm \
         ca-certificates \
         pacutils \
         perl-json-xs \
+        trurl \
  && pacman -Scc --noconfirm \
  && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
 
