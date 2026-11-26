@@ -171,25 +171,46 @@ if [[ "$ABI_CHECK" == "1" && -x "$CHECK_ABI" && -d "${CHROOT_ROOT}/usr/lib" ]]; 
         ABI_REASON["$name"]="$reason"
     done < <(ABI_STATE_DIR="$ABI_STATE_DIR" "$CHECK_ABI" --root "$CHROOT_ROOT" --repo-dir "$REPO_DIR" --name "$REPO_NAME" "${PKGS[@]}" 2>/tmp/abi-check.log)
     cat /tmp/abi-check.log >&2 2>/dev/null || true
+    mkdir -p "${ABI_STATE_DIR}/baseline"
+    # tokens_of REASON -> one missing lib / python=X->Y per line
+    tokens_of() { sed 's/^missing=//; s/ python=/,python=/' <<<"$1" | tr ',' '\n' | sed '/^$/d' | sort -u; }
     for pkg in "${PKGS[@]}"; do
         state="${ABI_STATE_DIR}/attempts/${pkg}"
-        if [[ -z "${ABI_REASON[$pkg]:-}" ]]; then
+        base="${ABI_STATE_DIR}/baseline/${pkg}"
+        reason="${ABI_REASON[$pkg]:-}"
+        if [[ -z "$reason" ]]; then
             rm -f "$state"            # healthy again — forget past attempts
+            [[ -f "$base" ]] || : > "$base"
             continue
         fi
         # Already being rebuilt for a newer upstream version: that build links
         # the new libs, no forced bump needed.
         in_list=0; for t in "${TO_BUILD[@]}"; do [[ "$t" == "$pkg" ]] && in_list=1; done
         (( in_list )) && continue
-        if [[ -f "$state" && "$(cat "$state")" == "${ABI_REASON[$pkg]}" ]]; then
-            ABI_STUCK+=( "$pkg" )
-            echo "[update] ABI: $pkg still stale after a rebuild (${ABI_REASON[$pkg]}) — needs an upstream update; not retrying" >&2
+        # Baseline: what was ALREADY unresolved the first time we looked at this
+        # package. Packages that ship e.g. a plugin needing libjvm.so without
+        # depending on a JRE were never complete; rebuilding cannot fix that.
+        # Only libraries that go missing AFTER the baseline count as drift.
+        if [[ ! -f "$base" ]]; then
+            printf '%s' "$reason" > "$base"
+            echo "[update] ABI: $pkg: recorded pre-existing unresolved libs as baseline ($reason) — not treated as drift"
+            rm -f "$state"
             continue
         fi
-        printf '%s' "${ABI_REASON[$pkg]}" > "$state"
+        new_tokens="$(comm -23 <(tokens_of "$reason") <(tokens_of "$(cat "$base")") | paste -sd, -)"
+        if [[ -z "$new_tokens" ]]; then
+            rm -f "$state"
+            continue
+        fi
+        if [[ -f "$state" && "$(cat "$state")" == "$new_tokens" ]]; then
+            ABI_STUCK+=( "$pkg" )
+            echo "[update] ABI: $pkg still stale after a rebuild ($new_tokens) — needs an upstream update; not retrying" >&2
+            continue
+        fi
+        printf '%s' "$new_tokens" > "$state"
         ABI_STALE+=( "$pkg" )
         TO_BUILD+=( "$pkg" )
-        echo "[update] ABI: $pkg is stale (${ABI_REASON[$pkg]}) — queued for rebuild"
+        echo "[update] ABI: $pkg is stale ($new_tokens) — queued for rebuild"
     done
 fi
 
