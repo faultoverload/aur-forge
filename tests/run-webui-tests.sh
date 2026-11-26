@@ -320,11 +320,15 @@ if [[ "$HAVE_LIGHTTPD" -eq 1 ]]; then
     mkdir -p "${SMOKE_ROOT}/usr/lib/aur-forge/cgi-bin" \
              "${SMOKE_ROOT}/usr/lib/aur-forge/scripts"
     cp "${CGI}"/*.cgi "${SMOKE_ROOT}/usr/lib/aur-forge/cgi-bin/"
-    cp "${SCRIPTS}/lib-aur.sh" "${SMOKE_ROOT}/usr/lib/aur-forge/lib-aur.sh"
-    cp "${SCRIPTS}/lib-aur.sh" "${SMOKE_ROOT}/usr/lib/aur-forge/scripts/lib-aur.sh"
+    # Every helper script, like the production image (the CGIs also source
+    # approval-store.sh / pkg-analysis.sh from lib-aur.sh's directory).
+    for _s in "${SCRIPTS}"/*.sh; do
+        cp "$_s" "${SMOKE_ROOT}/usr/lib/aur-forge/${_s##*/}"
+        cp "$_s" "${SMOKE_ROOT}/usr/lib/aur-forge/scripts/${_s##*/}"
+    done
+    mkdir -p "${SMOKE_ROOT}/approvals" "${SMOKE_ROOT}/quarantine"
     chmod +x "${SMOKE_ROOT}/usr/lib/aur-forge/cgi-bin/"*.cgi
-    chmod +x "${SMOKE_ROOT}/usr/lib/aur-forge/lib-aur.sh"
-    chmod +x "${SMOKE_ROOT}/usr/lib/aur-forge/scripts/lib-aur.sh"
+    chmod +x "${SMOKE_ROOT}"/usr/lib/aur-forge/*.sh "${SMOKE_ROOT}"/usr/lib/aur-forge/scripts/*.sh
     cp "${WWW}/install.html" "${SMOKE_ROOT}/www/"
     cp "${WWW}/style.css"    "${SMOKE_ROOT}/www/"
 
@@ -360,6 +364,8 @@ setenv.add-environment = (
     "PKGLIST" => "${SMOKE_ROOT}/pkglist.txt",
     "CSRF_SECRET_FILE" => "${SMOKE_ROOT}/csrf-secret",
     "REPO_DIR_DEFAULT" => "${SMOKE_ROOT}/repo/custom.x86_64",
+    "APPROVALS_DIR" => "${SMOKE_ROOT}/approvals",
+    "QUARANTINE_DIR" => "${SMOKE_ROOT}/quarantine",
 )
 \$HTTP["url"] =~ "^/cgi-bin" {
     cgi.assign = ( "" => "" )
@@ -406,6 +412,18 @@ EOF
         # Test 4: GET /cgi-bin/index.cgi directly.
         code="$(curl -s -o "${SMOKE_ROOT}/index2.out" -w '%{http_code}' "http://127.0.0.1:18080/cgi-bin/index.cgi")"
         assert_eq "$code" "200" "GET /cgi-bin/index.cgi → 200"
+
+        # Test 4b: the package page links from the index and renders under lighttpd.
+        assert_contains "/cgi-bin/package.cgi?name=yay" "$(cat "${SMOKE_ROOT}/index.out")" "index links each package to its detail page"
+        code="$(PKG_PAGE_OFFLINE=1 curl -s -o "${SMOKE_ROOT}/pkg.out" -w '%{http_code}' "http://127.0.0.1:18080/cgi-bin/package.cgi?name=yay")"
+        assert_eq "$code" "200" "GET /cgi-bin/package.cgi?name=yay → 200"
+        assert_contains "yay" "$(cat "${SMOKE_ROOT}/pkg.out")" "package page names the package"
+        # A quarantined clone on disk must surface on the index with a review link.
+        mkdir -p "${SMOKE_ROOT}/quarantine/yay-31337"; printf 'pkgname=yay\n' > "${SMOKE_ROOT}/quarantine/yay-31337/PKGBUILD"
+        curl -s "http://127.0.0.1:18080/" > "${SMOKE_ROOT}/index3.out"
+        assert_contains "awaiting quarantine review" "$(cat "${SMOKE_ROOT}/index3.out")" "index shows a banner when a package is quarantined"
+        assert_contains "review" "$(cat "${SMOKE_ROOT}/index3.out")" "index links quarantined packages to review"
+        rm -rf "${SMOKE_ROOT}/quarantine/yay-31337"
 
         # Test 5: GET /custom.x86_64/custom.db.tar.zst — static pacman
         # repo path.

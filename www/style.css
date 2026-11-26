@@ -78,3 +78,24 @@ input[type=submit]:hover { background: #8df; }
 .notice-ok { border-color: var(--ok); }
 .notice-err { border-color: var(--err); }
 footer { margin-top: 2em; padding-top: 1em; border-top: 1px solid var(--border); font-size: 0.9em; color: #888; }
+.status-rejected { color: var(--err); text-decoration: line-through; }
+.muted { color: #888; }
+.sev-high { color: var(--err); font-weight: bold; }
+.sev-medium { color: var(--warn); }
+.sev-info { color: #8ab; }
+pre.listing { padding: 0.4em 0; }
+pre.listing span { display: block; padding: 0 0.8em; white-space: pre; }
+pre.listing .ln { display: inline; padding: 0 0.6em 0 0; color: #777; user-select: none; }
+.hl-high { background: #4a1818; }
+.hl-medium { background: #4a3a10; }
+.hl-info { background: #14303f; }
+pre.diff { white-space: pre; }
+.decision { display: flex; flex-wrap: wrap; gap: 1em; }
+.decision-form { flex: 1 1 320px; }
+.decision-form.approve { border-color: var(--ok); }
+.decision-form.reject { border-color: var(--err); }
+form.inline { display: inline-block; margin: 0.3em 0; padding: 0.4em 0.8em; }
+table.facts th { width: 14em; }
+details { margin: 0.8em 0; }
+summary { cursor: pointer; color: var(--accent); }
+.banner { padding: 0.8em 1em; border: 1px solid var(--err); background: #2a1414; margin: 1em 0; }
