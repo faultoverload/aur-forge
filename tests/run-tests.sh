@@ -386,6 +386,131 @@ else
 fi
 
 echo
+echo "=== mini-mirror: prune / rebuild-bump / check-abi / mirror / issue auth ==="
+# --- prune-repo.sh ----------------------------------------------------------
+# shellcheck disable=SC1090
+source "${SCRIPTS}/prune-repo.sh"
+PR_TMP="${TEST_TMP}/prune"; mkdir -p "$PR_TMP"
+printf '%s\n' foo-1.0-1-x86_64.pkg.tar.zst foo-1.1-1-x86_64.pkg.tar.zst foo-1.2-1-x86_64.pkg.tar.zst \
+    foo-1.2-1.1-x86_64.pkg.tar.zst bar-1-1-any.pkg.tar.zst 'tri-1:1.68-1-any.pkg.tar.zst' 'tri-2.0-1-any.pkg.tar.zst' \
+    > "$PR_TMP/files"
+: > "$PR_TMP/protected"
+assert_eq "$(prune_candidates 2 "$PR_TMP/protected" < "$PR_TMP/files" | sort | tr '\n' ' ')" \
+    "foo-1.0-1-x86_64.pkg.tar.zst foo-1.1-1-x86_64.pkg.tar.zst " "prune keeps newest 2 per package (rebuild suffix + epoch ordering)"
+assert_eq "$(prune_candidates 1 "$PR_TMP/protected" < "$PR_TMP/files" | sort | tr '\n' ' ')" \
+    "foo-1.0-1-x86_64.pkg.tar.zst foo-1.1-1-x86_64.pkg.tar.zst foo-1.2-1-x86_64.pkg.tar.zst tri-2.0-1-any.pkg.tar.zst " \
+    "prune --keep 1 honours epoch (1:1.68 beats 2.0)"
+echo "foo-1.0-1" > "$PR_TMP/protected"
+assert_eq "$(prune_candidates 1 "$PR_TMP/protected" < "$PR_TMP/files" | grep -c 'foo-1.0-1')" "0" "prune never removes the version the db points at"
+# end-to-end with a real tar db
+mkdir -p "$PR_TMP/repo/dbsrc/foo-1.2-1.1"; : > "$PR_TMP/repo/dbsrc/foo-1.2-1.1/desc"
+tar --zstd -C "$PR_TMP/repo/dbsrc" -cf "$PR_TMP/repo/aur-forge.db.tar.zst" foo-1.2-1.1
+for f in foo-1.0-1 foo-1.1-1 foo-1.2-1 foo-1.2-1.1; do : > "$PR_TMP/repo/${f}-x86_64.pkg.tar.zst"; : > "$PR_TMP/repo/${f}-x86_64.pkg.tar.zst.sig"; done
+bash "${SCRIPTS}/prune-repo.sh" --keep 2 --repo-dir "$PR_TMP/repo" --name aur-forge >/dev/null 2>&1
+assert_eq "$(cd "$PR_TMP/repo" && ls foo-*.pkg.tar.zst | tr '\n' ' ')" "foo-1.2-1-x86_64.pkg.tar.zst foo-1.2-1.1-x86_64.pkg.tar.zst " "prune-repo.sh removes old files"
+assert_eq "$(cd "$PR_TMP/repo" && ls foo-*.sig | wc -l | tr -d ' ')" "2" "prune-repo.sh removes the matching .sig files"
+rm -f "$PR_TMP/repo/aur-forge.db.tar.zst"
+assert_eq "$(bash "${SCRIPTS}/prune-repo.sh" --keep 1 --repo-dir "$PR_TMP/repo" --name aur-forge 2>/dev/null | wc -l | tr -d ' ')" "0" "prune-repo.sh refuses to delete without a db"
+
+# --- rebuild-bump.sh --------------------------------------------------------
+# shellcheck disable=SC1090
+source "${SCRIPTS}/rebuild-bump.sh"
+rb() { next_rebuild_pkgrel "$@" 2>/dev/null || echo REFUSE; }
+assert_eq "$(rb "" "" 1.0 1)"            "1"      "first build keeps upstream pkgrel"
+assert_eq "$(rb 1.0-1 "" 1.0 1)"         "1.1"    "same version in repo -> pkgrel 1.1"
+assert_eq "$(rb 1.0-1.1 "" 1.0 1)"       "1.2"    "second rebuild -> 1.2"
+assert_eq "$(rb 1.0-1.9 "" 1.0 1)"       "1.10"   "1.9 -> 1.10 (numeric, not lexical)"
+assert_eq "$(rb 1.0-1.2 "" 1.0 2)"       "2"      "upstream pkgrel 2 supersedes our 1.2"
+assert_eq "$(rb 1.0-1 "" 1.1 1)"         "1"      "newer upstream pkgver needs no bump"
+assert_eq "$(rb 1:1.68-1 1 1.68 1)"      "1.1"    "epoch is honoured"
+assert_eq "$(rb 1.1-1 "" 1.0 1)"         "REFUSE" "upstream pkgver went backwards -> refuse"
+
+# --- check-abi.sh (real ELF via gcc when available) -------------------------
+if command -v gcc >/dev/null 2>&1 && command -v readelf >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
+    AB="${TEST_TMP}/abi"; mkdir -p "$AB/build" "$AB/repo"
+    cat > "$AB/build/foo.c" <<'EOC'
+int foo(void) { return 1; }
+EOC
+    cat > "$AB/build/main.c" <<'EOC'
+int foo(void);
+int main(void) { return foo() - 1; }
+EOC
+    ( cd "$AB/build" \
+      && gcc -shared -fPIC -Wl,-soname,libfoo.so.1 -o libfoo.so.1 foo.c \
+      && gcc main.c -o app -L. -l:libfoo.so.1 )
+    # package "app": needs libfoo.so.1 (+ libc) and does NOT ship it
+    mkdir -p "$AB/pkg-app/usr/bin"; cp "$AB/build/app" "$AB/pkg-app/usr/bin/app"
+    tar --zstd -C "$AB/pkg-app" -cf "$AB/repo/app-1.0-1-x86_64.pkg.tar.zst" usr
+    # package "pyfoo": python 3.14 payload
+    mkdir -p "$AB/pkg-py/usr/lib/python3.14/site-packages"; echo x > "$AB/pkg-py/usr/lib/python3.14/site-packages/m.py"
+    tar --zstd -C "$AB/pkg-py" -cf "$AB/repo/pyfoo-1.0-1-any.pkg.tar.zst" usr
+    # package "bundled": ships its own libfoo.so.1 next to the binary
+    mkdir -p "$AB/pkg-b/opt/b"; cp "$AB/build/app" "$AB/build/libfoo.so.1" "$AB/pkg-b/opt/b/"
+    tar --zstd -C "$AB/pkg-b" -cf "$AB/repo/bundled-1.0-1-x86_64.pkg.tar.zst" opt
+    run_abi() { ABI_STATE_DIR="$AB/state-$1" bash "${SCRIPTS}/check-abi.sh" --root "$2" --repo-dir "$AB/repo" 2>/dev/null; }
+    mkroot() { mkdir -p "$AB/$1/usr/lib"; : > "$AB/$1/usr/lib/libc.so.6"; : > "$AB/$1/usr/lib/libm.so.6"; }
+    mkroot rootok;  : > "$AB/rootok/usr/lib/libfoo.so.1"; mkdir -p "$AB/rootok/usr/lib/python3.14"
+    mkroot rootbad; : > "$AB/rootbad/usr/lib/libfoo.so.2"; mkdir -p "$AB/rootbad/usr/lib/python3.15"
+    assert_eq "$(run_abi ok "$AB/rootok" | wc -l | tr -d ' ')" "0" "check-abi: healthy chroot -> nothing stale"
+    bad="$(run_abi bad "$AB/rootbad")"
+    case "$bad" in *$'app\tmissing=libfoo.so.1'*) pass "check-abi: soname gone -> app flagged (missing=libfoo.so.1)" ;; *) fail "check-abi: app not flagged (got: $bad)" ;; esac
+    case "$bad" in *$'pyfoo\tpython=3.14->3.15'*) pass "check-abi: python minor bump -> pyfoo flagged" ;; *) fail "check-abi: pyfoo not flagged (got: $bad)" ;; esac
+    case "$bad" in *bundled*) fail "check-abi: bundled lib should satisfy the dependency (got: $bad)" ;; *) pass "check-abi: package bundling its own lib is not flagged" ;; esac
+    # a lib the OFFICIAL repos provide (sync db %PROVIDES%) is obtainable at install
+    # time even though the minimal chroot lacks it -> not stale
+    mkdir -p "$AB/rootprov/usr/lib" "$AB/rootprov/var/lib/pacman/sync" "$AB/dbsrc/libfoo-1-1"
+    : > "$AB/rootprov/usr/lib/libc.so.6"; : > "$AB/rootprov/usr/lib/libm.so.6"; : > "$AB/rootprov/usr/lib/libfoo.so.2"
+    mkdir -p "$AB/rootprov/usr/lib/python3.14"
+    printf '%%NAME%%\nlibfoo\n\n%%PROVIDES%%\nlibfoo.so=1-64\n\n%%DEPENDS%%\nglibc\n' > "$AB/dbsrc/libfoo-1-1/desc"
+    tar -C "$AB/dbsrc" -czf "$AB/rootprov/var/lib/pacman/sync/extra.db" libfoo-1-1
+    assert_eq "$(run_abi prov "$AB/rootprov" | wc -l | tr -d ' ')" "0" "check-abi: soname provided by an official package is not stale"
+    # ...and the same for a lib only visible in a files db (no %PROVIDES%)
+    mkdir -p "$AB/rootfiles/usr/lib/python3.14" "$AB/rootfiles/var/lib/pacman/sync" "$AB/fdbsrc/libfoo-1-1"
+    : > "$AB/rootfiles/usr/lib/libc.so.6"; : > "$AB/rootfiles/usr/lib/libm.so.6"
+    printf '%%FILES%%\nusr/\nusr/lib/\nusr/lib/libfoo.so.1\n' > "$AB/fdbsrc/libfoo-1-1/files"
+    tar -C "$AB/fdbsrc" -czf "$AB/rootfiles/var/lib/pacman/sync/extra.files" libfoo-1-1
+    assert_eq "$(run_abi files "$AB/rootfiles" | wc -l | tr -d ' ')" "0" "check-abi: soname present in an official files db is not stale"
+    # second run re-uses the cache and gives the same answer
+    assert_eq "$(ABI_STATE_DIR="$AB/state-bad" bash "${SCRIPTS}/check-abi.sh" --root "$AB/rootbad" --repo-dir "$AB/repo" 2>/dev/null)" "$bad" "check-abi: cached run is stable"
+else
+    echo "  SKIP: check-abi ELF tests need gcc + readelf + zstd"
+fi
+
+# --- PACMAN_MIRROR (init.sh) ------------------------------------------------
+ML="${TEST_TMP}/mirrorlist"; printf 'Server = https://geo.example/$repo/os/$arch\n' > "$ML"
+export PACMAN_MIRROR='http://pacoloco:9129/repo/archlinux/$repo/os/$arch'
+( source <(sed -n '/^configure_pacman_mirror()/,/^}/p' "${REPO_ROOT}/init.sh"); configure_pacman_mirror "$ML" >/dev/null; configure_pacman_mirror "$ML" >/dev/null )
+assert_eq "$(grep -c 'pacoloco' "$ML")" "1" "PACMAN_MIRROR is added once (idempotent)"
+assert_eq "$(sed -n 2p "$ML")" 'Server = http://pacoloco:9129/repo/archlinux/$repo/os/$arch' "PACMAN_MIRROR goes first, stock mirror kept as fallback"
+( export PACMAN_MIRROR=; source <(sed -n '/^configure_pacman_mirror()/,/^}/p' "${REPO_ROOT}/init.sh"); configure_pacman_mirror "$ML" >/dev/null )
+assert_eq "$(grep -c 'pacoloco' "$ML")" "0" "unsetting PACMAN_MIRROR removes the block"
+unset PACMAN_MIRROR
+
+# --- wiring / regressions ---------------------------------------------------
+if grep -rn 'token \*\*\*' "${REPO_ROOT}/scripts" "${REPO_ROOT}"/*.sh >/dev/null 2>&1; then
+    fail "a script sends the literal Authorization header 'token ***' (redaction artifact)"
+else
+    pass "no literal 'token ***' Authorization header in any script"
+fi
+if grep -q 'token \${GITHUB_TOKEN}' "${SCRIPTS}/open-quarantine-issue.sh"; then
+    pass "open-quarantine-issue.sh authenticates with \${GITHUB_TOKEN}"
+else
+    fail "open-quarantine-issue.sh does not use \${GITHUB_TOKEN}"
+fi
+grep -q 'already exists for' "${SCRIPTS}/open-quarantine-issue.sh" \
+    && pass "open-quarantine-issue.sh de-duplicates open Issues" || fail "open-quarantine-issue.sh has no duplicate guard"
+grep -q 'build.sh --scan-only' "${REPO_ROOT}/run.sh" \
+    && pass "nightly re-scan uses --scan-only (not the no-op --dry-run)" || fail "run.sh re-scan still uses --dry-run"
+for h in prune-repo check-abi rebuild-bump; do
+    grep -q "/usr/local/bin/${h}.sh" "${REPO_ROOT}/Dockerfile" \
+        && pass "Dockerfile links ${h}.sh into /usr/local/bin" || fail "Dockerfile does not link ${h}.sh"
+done
+for v in PACMAN_MIRROR KEEP_VERSIONS ABI_CHECK; do
+    grep -E '^PassEnvironment=' "${REPO_ROOT}/aur-forge.service" | grep -qw "$v" \
+        && pass "service forwards $v" || fail "service does not forward $v"
+done
+
+echo
 echo "=== summary ==="
 echo "passed: $PASS"
 echo "failed: $FAIL"

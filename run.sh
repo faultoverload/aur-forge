@@ -94,13 +94,12 @@ nightly_sequence() {
     # approval hash; any drift opens a quarantine Issue.
     if [[ -s "${PKGLIST:-/pkglist}" ]]; then
         echo "${LOG_TAG} [scheduler] archcanary re-scan"
-        # Run with --dry-run so we don't rebuild every package — only
-        # the rebuilds the diff scan already triggered in step 1 should
-        # land in /repo. The gate still opens Issues for any PKGBUILD
-        # drift detected during the scan. The --dry-run flag in
-        # build.sh / archcanary integration is intended for exactly this
-        # "scan only" mode.
-        if ! PKGLIST="${PKGLIST:-/pkglist}" /usr/local/bin/build.sh --dry-run 2>&1; then
+        # --scan-only: clone + archcanary + PKGBUILD-diff gate for every
+        # package, no chroot build. (This used to pass --dry-run, which
+        # returns BEFORE the clone/gate — i.e. the re-scan scanned nothing.)
+        # Drift vs. the stored approval opens a quarantine Issue (deduped by
+        # open-quarantine-issue.sh); rebuilds themselves are step 1's job.
+        if ! PKGLIST="${PKGLIST:-/pkglist}" /usr/local/bin/build.sh --scan-only 2>&1; then
             echo "${LOG_TAG} [scheduler] archcanary re-scan failed (rc=$?); continuing" >&2
         fi
     fi

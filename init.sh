@@ -213,6 +213,26 @@ fi
 # runs with --no-listing so the empty directory is harmless.
 
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Optional LAN caching mirror (pacoloco).
+# ---------------------------------------------------------------------
+# PACMAN_MIRROR is a full pacman Server template, e.g.
+#   http://pacoloco:9129/repo/archlinux/$repo/os/$arch
+# It is placed FIRST in the host mirrorlist (used for the chroot bootstrap) and
+# in the chroot's own mirrorlist (used by every `pacman -Syuu` / makepkg
+# --syncdeps). The stock mirrors stay below it, so pacman falls back to them if
+# the cache is down. Unset PACMAN_MIRROR removes our block again. Idempotent.
+configure_pacman_mirror() {
+    local f="$1" url="${PACMAN_MIRROR:-}" marker="# aur-forge: PACMAN_MIRROR"
+    [[ -f "$f" ]] || return 0
+    sed -i "/${marker}/,+1d" "$f"
+    if [[ -n "$url" ]]; then
+        { printf '%s\nServer = %s\n' "$marker" "$url"; cat "$f"; } > "${f}.new" && mv -f "${f}.new" "$f"
+        echo "[init] pacman mirror: $url first in $f"
+    fi
+}
+configure_pacman_mirror /etc/pacman.d/mirrorlist
+
 # Bootstrap the devtools chroot the first time the container starts.
 # ---------------------------------------------------------------------
 # extra-x86_64-build (called by build.sh) refuses to run unless
@@ -292,6 +312,7 @@ if [[ ! -d "${CHROOT_ROOT}/etc/pacman.d/gnupg" ]] || \
         echo "[init] WARNING: host keyring missing; chroot builds will fail to verify signatures"
     fi
 fi
+configure_pacman_mirror "${CHROOT_ROOT}/etc/pacman.d/mirrorlist"
 
 echo "[init] ready."
 echo "       pubkey: /keys/aur-forge.pub"

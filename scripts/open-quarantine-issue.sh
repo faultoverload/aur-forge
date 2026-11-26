@@ -99,11 +99,25 @@ main() {
         --argjson labels "$LABELS_JSON" \
         '{title: $title, body: $body, labels: $labels}')"
 
+    # De-duplicate: the nightly scan re-evaluates every package, so a package
+    # that stays quarantined (or drifts and is not yet approved) would otherwise
+    # get a NEW Issue every night. Skip if an open Issue with this exact title
+    # already exists.
+    EXISTING="$(curl -sS \
+        -H "Authorization: token ${GITHUB_TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "${GITHUB_API}/repos/${REPO}/issues?state=open&labels=quarantine%2Fblocked&per_page=100" 2>/dev/null || true)"
+    if jq -e --arg t "$TITLE" 'type == "array" and any(.[]; .title == $t)' <<<"$EXISTING" >/dev/null 2>&1; then
+        echo "[open-quarantine-issue] open Issue already exists for ${PKG} (${REASON}) — not filing a duplicate"
+        exit 0
+    fi
+
     RESPONSE_FILE="$(mktemp)"
     HTTP_CODE="$(
         curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' \
             -X POST \
-            -H "Authorization: token ***" \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API}/repos/${REPO}/issues" \

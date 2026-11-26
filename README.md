@@ -306,6 +306,47 @@ it needs (`REPO_NAME`, `GITHUB_TOKEN`, `GITHUB_REPO`, `TZ`, `NIGHTLY_AT`, …) i
 `PassEnvironment=`. A new setting read by `run.sh`/`build.sh`/`update.sh` must
 be added to that line, or it silently falls back to its default.
 
+### Rebuilds when libraries change underneath a package (ABI drift)
+
+The nightly `update.sh` only rebuilds when the AUR *version* changes. A package
+can still break because Arch bumped a soname (`libfoo.so.1` -> `.2`) or the
+Python minor version. After refreshing the build chroot (`pacman -Syuu`, `-Fy`),
+`scripts/check-abi.sh` compares every served package against it:
+
+* every ELF `DT_NEEDED` soname must be provided by the chroot, by an official
+  package (sync-db `%PROVIDES%` or files db), by the package itself (bundled
+  libs) or by another package in this repo;
+* `usr/lib/pythonX.Y` payloads must match a Python in the chroot.
+
+Stale packages are queued for a rebuild with a **decimal pkgrel suffix**
+(`1` -> `1.1` -> `1.2`, see `scripts/rebuild-bump.sh`) so pacman clients actually
+see an update; a real upstream `pkgrel 2` still supersedes it. If a rebuild does
+not change the verdict (a `-bin` package linking a library that no longer
+exists), the package is reported as *stuck* and **not retried** until upstream
+releases. Not checked: `dlopen()`ed libraries and perl/ruby/node module ABIs.
+Run it by hand: `docker exec aur-forge check-abi.sh` (stdout = stale packages).
+Disable with `ABI_CHECK=0`. Per-package scan results are cached in `/cache/abi`.
+
+### Pruning, and what `update.sh` skips
+
+After a build, `prune-repo.sh` keeps the newest `KEEP_VERSIONS` (default 2:
+current + one rollback) files per package and never removes the version the db
+points at. `repo-add` only adds the files just built.
+
+`update.sh` skips an `OutOfDate`-flagged package only once a build of it is
+already served; a package that was never built is built regardless. "Up to date"
+means *repo version >= AUR version*, so our own `1.1` rebuilds do not loop.
+VCS packages (`*-git`, `*-svn`) are not supported: their AUR `Version` is stale
+by design, so the diff scan cannot tell when they changed.
+
+### Optional LAN package cache (`PACMAN_MIRROR`)
+
+Set `PACMAN_MIRROR` to a pacman `Server` template, e.g.
+`http://pacoloco:9129/repo/archlinux/$repo/os/$arch`, and `init.sh` puts it
+first in the host and chroot mirrorlists (stock mirrors stay as fallback). Use it
+with a caching proxy such as [pacoloco](https://github.com/anatol/pacoloco) so
+every chroot refresh and `makepkg --syncdeps` is served from the LAN.
+
 ## Nightly upstream-version check
 
 `aur-forge` ships an `update` subcommand that:

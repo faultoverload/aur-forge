@@ -106,7 +106,12 @@ _ver_gt() {
     if command -v vercmp >/dev/null 2>&1; then
         (( $(vercmp "$1" "$2") > 0 ))
     else
-        [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+        # No vercmp (dev host): compare epochs numerically, then `sort -V`.
+        local a="$1" b="$2" ea=0 eb=0
+        [[ "$a" == *:* ]] && { ea="${a%%:*}"; a="${a#*:}"; }
+        [[ "$b" == *:* ]] && { eb="${b%%:*}"; b="${b#*:}"; }
+        if (( ea != eb )); then (( ea > eb )); return; fi
+        [[ "$a" != "$b" && "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$a" ]]
     fi
 }
 
