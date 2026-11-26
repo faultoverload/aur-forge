@@ -118,24 +118,87 @@ for pkg in "${PKGS[@]}"; do
         NOT_FOUND+=( "$pkg" )
         continue
     fi
-    if [[ "${AUR_OOD[$pkg]:-}" != "null" && -n "${AUR_OOD[$pkg]:-}" ]]; then
+    aur_ver="${AUR_VER[$pkg]}"
+    repo_ver="${REPO_VER[$pkg]:-}"
+    # OutOfDate packages are skipped — but only once we already serve a build
+    # of them. A package that was never built has nothing to protect, and the
+    # operator explicitly listed it.
+    if [[ "${AUR_OOD[$pkg]:-}" != "null" && -n "${AUR_OOD[$pkg]:-}" && -n "$repo_ver" ]]; then
         SKIPPED_OOD+=( "$pkg" )
         continue
     fi
-    aur_ver="${AUR_VER[$pkg]}"
-    repo_ver="${REPO_VER[$pkg]:-}"
-    if [[ "$aur_ver" == "$repo_ver" && -n "$repo_ver" ]]; then
+    # Up to date = the repo serves this version OR NEWER. Newer happens with our
+    # own rebuilds (pkgrel 1 -> 1.1, see scripts/rebuild-bump.sh); strict
+    # equality would rebuild those every night.
+    if [[ -n "$repo_ver" ]] && { [[ "$aur_ver" == "$repo_ver" ]] || _ver_gt "$repo_ver" "$aur_ver"; }; then
         SKIPPED_UP_TO_DATE+=( "$pkg" )
         continue
     fi
     TO_BUILD+=( "$pkg" )
 done
 
+# ---------------------------------------------------------------------
+# Phase 3b: ABI drift. A package can be current upstream and still be broken
+# because Arch moved a library soname / the python minor underneath it. Refresh
+# the build chroot, then ask check-abi.sh which served packages no longer
+# resolve; queue those for a (version-bumped) rebuild. Guard against a loop:
+# if a rebuild did not change the verdict, upstream has to fix it — stop
+# retrying and say so.
+# ---------------------------------------------------------------------
+ABI_STALE=()
+ABI_STUCK=()
+ABI_CHECK="${ABI_CHECK:-1}"
+ABI_STATE_DIR="${ABI_STATE_DIR:-/cache/abi}"
+CHROOT_ROOT="${CHROOT_ROOT:-/var/lib/archbuild/extra-x86_64/root}"
+CHECK_ABI="${CHECK_ABI:-/usr/local/bin/check-abi.sh}"
+if [[ "$ABI_CHECK" == "1" && -x "$CHECK_ABI" && -d "${CHROOT_ROOT}/usr/lib" ]]; then
+    mkdir -p "${ABI_STATE_DIR}/attempts"
+    echo "[update] ABI check: refreshing build chroot ($CHROOT_ROOT)"
+    # -Syuu: same refresh archbuild does before every build. -Fy: files dbs, so
+    # check-abi can tell "library obtainable from an official package" (the build
+    # chroot is minimal and lacks e.g. libx11) from "library really gone".
+    if ! flock "${CHROOT_ROOT%/root}/root.lock" bash -c '
+            export SUDO_USER="${SUDO_USER:-builder}"   # arch-nspawn names its slice devtools-$SUDO_USER; empty under docker exec
+            nspawn=(arch-nspawn -C /usr/share/devtools/pacman.conf.d/extra.conf \
+                                -M /usr/share/devtools/makepkg.conf.d/x86_64.conf "$1")
+            "${nspawn[@]}" pacman -Syuu --noconfirm && "${nspawn[@]}" pacman -Fy --noconfirm' _ "$CHROOT_ROOT" \
+            >/tmp/abi-refresh.log 2>&1; then
+        echo "[update] ABI check: chroot refresh failed (see /tmp/abi-refresh.log) — using stale chroot view" >&2
+    fi
+    declare -A ABI_REASON=()
+    while IFS=$'\t' read -r name reason; do
+        [[ -z "$name" ]] && continue
+        ABI_REASON["$name"]="$reason"
+    done < <(ABI_STATE_DIR="$ABI_STATE_DIR" "$CHECK_ABI" --root "$CHROOT_ROOT" --repo-dir "$REPO_DIR" --name "$REPO_NAME" "${PKGS[@]}" 2>/tmp/abi-check.log)
+    cat /tmp/abi-check.log >&2 2>/dev/null || true
+    for pkg in "${PKGS[@]}"; do
+        state="${ABI_STATE_DIR}/attempts/${pkg}"
+        if [[ -z "${ABI_REASON[$pkg]:-}" ]]; then
+            rm -f "$state"            # healthy again — forget past attempts
+            continue
+        fi
+        # Already being rebuilt for a newer upstream version: that build links
+        # the new libs, no forced bump needed.
+        in_list=0; for t in "${TO_BUILD[@]}"; do [[ "$t" == "$pkg" ]] && in_list=1; done
+        (( in_list )) && continue
+        if [[ -f "$state" && "$(cat "$state")" == "${ABI_REASON[$pkg]}" ]]; then
+            ABI_STUCK+=( "$pkg" )
+            echo "[update] ABI: $pkg still stale after a rebuild (${ABI_REASON[$pkg]}) — needs an upstream update; not retrying" >&2
+            continue
+        fi
+        printf '%s' "${ABI_REASON[$pkg]}" > "$state"
+        ABI_STALE+=( "$pkg" )
+        TO_BUILD+=( "$pkg" )
+        echo "[update] ABI: $pkg is stale (${ABI_REASON[$pkg]}) — queued for rebuild"
+    done
+fi
+
 echo "[update] upstream summary:"
 echo "         need rebuild   : ${#TO_BUILD[@]} (${TO_BUILD[*]:-none})"
 echo "         up-to-date    : ${#SKIPPED_UP_TO_DATE[@]}"
 echo "         marked OOD    : ${#SKIPPED_OOD[@]} (${SKIPPED_OOD[*]:-none})"
 echo "         not in AUR    : ${#NOT_FOUND[@]} (${NOT_FOUND[*]:-none})"
+echo "         abi-stale     : ${#ABI_STALE[@]} (${ABI_STALE[*]:-none}); stuck after rebuild: ${#ABI_STUCK[@]} (${ABI_STUCK[*]:-none})"
 
 if [[ ${#TO_BUILD[@]} -eq 0 ]]; then
     echo "[update] nothing to build — exiting."
@@ -157,4 +220,4 @@ trap 'rm -f "$TMP_LIST"' EXIT
 } > "$TMP_LIST"
 
 echo "[update] launching build for ${#TO_BUILD[@]} package(s)"
-PKGLIST="$TMP_LIST" /usr/local/bin/build.sh
+AUR_FORGE_REBUILD="${ABI_STALE[*]:-}" PKGLIST="$TMP_LIST" /usr/local/bin/build.sh

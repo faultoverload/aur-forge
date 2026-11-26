@@ -30,7 +30,7 @@ ExecStart=/usr/local/bin/run.sh
 # NIGHTLY_AT set in compose never reach them. PassEnvironment= forwards
 # the named variables from the manager's environment; names that are
 # unset are skipped, so this is safe for optional settings.
-PassEnvironment=REPO_NAME REPO_OWNER REPO_EMAIL GITHUB_REPO GITHUB_TOKEN TZ NIGHTLY_AT PORT GPG_PASSPHRASE GPG_KEY_NAME STRICT_FIRST_BUILD
+PassEnvironment=REPO_NAME REPO_OWNER REPO_EMAIL GITHUB_REPO GITHUB_TOKEN TZ NIGHTLY_AT PORT GPG_PASSPHRASE GPG_KEY_NAME STRICT_FIRST_BUILD PACMAN_MIRROR KEEP_VERSIONS ABI_CHECK
 # SIGTERM forward: run.sh's trap exits 0 within ~60s. After that
 # systemd treats it as a clean stop and restarts per policy.
 Restart=always

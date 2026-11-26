@@ -16,6 +16,8 @@ source "${SCRIPT_DIR}/approval-store.sh"
 source "${SCRIPT_DIR}/srcinfo-diff.sh"
 # shellcheck source=scripts/open-quarantine-issue.sh
 source "${SCRIPT_DIR}/open-quarantine-issue.sh"
+# shellcheck source=scripts/rebuild-bump.sh
+source "${SCRIPT_DIR}/rebuild-bump.sh"
 
 REPO_NAME="${REPO_NAME:-aur-forge}"
 REPO_OWNER="${REPO_OWNER:-faultoverload}"
@@ -474,13 +476,57 @@ configure_chroot_local_repo() {
     fi
 }
 
+# AUR_FORGE_REBUILD="pkgA pkgB": packages being rebuilt only because their
+# libraries moved underneath them (see scripts/check-abi.sh). Their PKGBUILD is
+# unchanged, so without a version bump the new file would be identical in
+# version to the old one and clients would never pick it up.
+rebuild_requested() { [[ " ${AUR_FORGE_REBUILD:-} " == *" $1 "* ]]; }
+
+# newest version of $1 currently in the repo dir ("" if none), as epoch:ver-rel.
+repo_newest_version() {
+    local name="$1" f b best="" v
+    for f in "$REPO_DIR"/"${name}"-*.pkg.tar.zst; do
+        [[ -e "$f" ]] || continue
+        b="${f##*/}"
+        [[ "$b" =~ ^(.+)-([^-]+-[^-]+)-([^-]+)\.pkg\.tar\.zst$ ]] || continue
+        [[ "${BASH_REMATCH[1]}" == "$name" ]] || continue
+        v="${BASH_REMATCH[2]}"
+        if [[ -z "$best" ]] || rb_ver_gt "$v" "$best"; then best="$v"; fi
+    done
+    printf '%s' "$best"
+}
+
+# bump_pkgrel_for_rebuild PKG WORKDIR — rewrite pkgrel in WORKDIR/PKGBUILD so
+# the rebuilt package is strictly newer than what the repo serves. Run AFTER the
+# gate (the approval hash is of the upstream PKGBUILD, not our edit) and as the
+# unprivileged builder (PKGBUILDs are untrusted code; --printsrcinfo sources one).
+bump_pkgrel_for_rebuild() {
+    local pkg="$1" work="$2" info epoch pkgver pkgrel new check
+    info="$(sudo -u builder bash -c 'cd "$1" && makepkg --printsrcinfo' _ "$work" 2>/dev/null)" || return 1
+    epoch="$(awk -F' = ' '/^\tepoch = /{print $2; exit}' <<<"$info" | tr -d '\t ')"
+    pkgver="$(awk -F' = ' '/^\tpkgver = /{print $2; exit}' <<<"$info" | tr -d '\t ')"
+    pkgrel="$(awk -F' = ' '/^\tpkgrel = /{print $2; exit}' <<<"$info" | tr -d '\t ')"
+    [[ -n "$pkgver" && -n "$pkgrel" ]] || return 1
+    new="$(next_rebuild_pkgrel "$(repo_newest_version "$pkg")" "$epoch" "$pkgver" "$pkgrel")" || return 1
+    if [[ "$new" == "$pkgrel" ]]; then
+        echo "[build] rebuild $pkg: upstream version already newer than repo — no bump needed"
+        return 0
+    fi
+    sudo -u builder sed -i -E "s/^pkgrel=.*/pkgrel=${new}/" "$work/PKGBUILD"
+    check="$(sudo -u builder bash -c 'cd "$1" && makepkg --printsrcinfo' _ "$work" 2>/dev/null \
+             | awk -F' = ' '/^\tpkgrel = /{print $2; exit}' | tr -d '\t ')"
+    [[ "$check" == "$new" ]] || { echo "[build] could not rewrite pkgrel for $pkg (PKGBUILD computes it)" >&2; return 1; }
+    echo "[build] rebuild $pkg: pkgrel ${pkgrel} -> ${new} (repo has $(repo_newest_version "$pkg"))"
+}
+
 mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$PKGLIST")
 echo "[build] $((${#PKGS[@]})) package(s) in pkglist"
 
 # Apply --only= filter if provided.
 if [[ -n "$ONLY_PKG" ]]; then
-    PKGS=("$ONLY_PKG")
-    echo "[build] --only=$ONLY_PKG — building single package"
+    # shellcheck disable=SC2206  # word-splitting the comma list is intentional
+    PKGS=(${ONLY_PKG//,/ })
+    echo "[build] --only=$ONLY_PKG — building ${#PKGS[@]} package(s)"
 fi
 
 BUILT=0
@@ -534,6 +580,14 @@ for pkg in "${PKGS[@]}"; do
     #   ERROR: You do not have write permission for the directory
     #          $SRCDEST (/cache/work/<pkg>).
     chown -R builder:builder "$WORK"
+    if rebuild_requested "$pkg"; then
+        if ! bump_pkgrel_for_rebuild "$pkg" "$WORK"; then
+            echo "[build] FAILED to prepare rebuild of $pkg (cannot produce a newer version)" >&2
+            FAILED=$((FAILED+1))
+            cd / && rm -rf "$WORK"
+            continue
+        fi
+    fi
     # NOTE: do NOT pass --no-check here. devtools < 1.2.0 doesn't
     # support it (illegal option -- ---), and the package list shipped
     # here (neofetch, plex-media-player, hermes-agent-desktop) has no
@@ -571,8 +625,16 @@ for pkg in "${PKGS[@]}"; do
     # Drop signed packages into the served repo dir, then reindex.
     cp -f -- *.pkg.tar.zst *.pkg.tar.zst.sig "$REPO_DIR/"
     cd "$REPO_DIR"
-    repo-add --sign --key "${FPR}" \
-        "${REPO_NAME}.db.tar.zst" -- *.pkg.tar.zst
+    # Add only what we just built. Re-adding every file in the dir re-processes
+    # old versions (noisy "newer version already present" warnings, wasted work)
+    # — the db already holds the other packages. First run / lost db: add all.
+    if [[ -s "${REPO_NAME}.db.tar.zst" ]]; then
+        repo-add --sign --key "${FPR}" \
+            "${REPO_NAME}.db.tar.zst" -- "${pkgfiles[@]}"
+    else
+        repo-add --sign --key "${FPR}" \
+            "${REPO_NAME}.db.tar.zst" -- *.pkg.tar.zst
+    fi
     [[ -f "${REPO_NAME}.db"     ]] || cp "${REPO_NAME}.db.tar.zst" "${REPO_NAME}.db" 2>/dev/null || true
     [[ -f "${REPO_NAME}.files"  ]] || cp "${REPO_NAME}.files.tar.zst" "${REPO_NAME}.files" 2>/dev/null || true
 
@@ -580,6 +642,12 @@ for pkg in "${PKGS[@]}"; do
     cd / && rm -rf "$WORK"
     echo "[build] OK: $pkg"
 done
+
+# Retire old package versions (keep KEEP_VERSIONS newest per package, default 2).
+if [[ "$BUILT" -gt 0 && "$DRY_RUN" -eq 0 && "$SCAN_ONLY" -eq 0 ]]; then
+    "${SCRIPT_DIR}/prune-repo.sh" --repo-dir "$REPO_DIR" --name "$REPO_NAME" || \
+        echo "[build] WARNING: prune-repo failed (non-fatal)" >&2
+fi
 
 echo
 echo "[build] done. built=$BUILT quarantined=$QUARANTINED failed=$FAILED total=${#PKGS[@]}"
