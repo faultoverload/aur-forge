@@ -501,6 +501,13 @@ grep -q 'already exists for' "${SCRIPTS}/open-quarantine-issue.sh" \
     && pass "open-quarantine-issue.sh de-duplicates open Issues" || fail "open-quarantine-issue.sh has no duplicate guard"
 grep -q 'build.sh --scan-only' "${REPO_ROOT}/run.sh" \
     && pass "nightly re-scan uses --scan-only (not the no-op --dry-run)" || fail "run.sh re-scan still uses --dry-run"
+# update.sh must keep its summary + early exit (a botched edit once dropped them)
+grep -q 'upstream summary' "${REPO_ROOT}/update.sh" && grep -q 'nothing to build' "${REPO_ROOT}/update.sh" \
+    && pass "update.sh prints the summary and exits when there is nothing to build" \
+    || fail "update.sh lost its summary / 'nothing to build' exit"
+grep -q 'recorded pre-existing unresolved libs as baseline' "${REPO_ROOT}/update.sh" \
+    && pass "update.sh baselines pre-existing unresolved libs (no pointless ABI rebuilds)" \
+    || fail "update.sh has no ABI baseline logic"
 for h in prune-repo check-abi rebuild-bump; do
     grep -q "/usr/local/bin/${h}.sh" "${REPO_ROOT}/Dockerfile" \
         && pass "Dockerfile links ${h}.sh into /usr/local/bin" || fail "Dockerfile does not link ${h}.sh"
