@@ -7,7 +7,9 @@
 # Status values:
 #   built          — *.pkg.tar.zst exists in /repo/<repo>.x86_64/
 #   building       — /cache/work/<pkg> exists (a clone is on disk)
-#   quarantined    — open GitHub Issue with quarantine/* label referencing this pkg
+#   quarantined    — a quarantined clone on disk and/or an open [QUARANTINE] Issue; the
+#                    row links to the package page (cgi-bin/package.cgi) to review it
+#   rejected       — this exact PKGBUILD was rejected; not built until it changes
 #   missing        — package is in pkglist.txt but not in /repo (no build yet)
 #
 # The page also renders:
@@ -34,6 +36,10 @@ if [[ -z "$LIB" ]]; then
 fi
 # shellcheck disable=SC1090
 . "$LIB"
+export APPROVALS_DIR="${APPROVALS_DIR:-/approvals}"
+export QUARANTINE_DIR="${QUARANTINE_DIR:-/cache/work-quarantine}"
+# shellcheck disable=SC1090,SC1091
+. "$(dirname "$LIB")/approval-store.sh"
 
 # lib-aur.sh defaults REPO_NAME/PKGLIST from env; respect those.
 
@@ -71,28 +77,33 @@ fi
 # Build status from local filesystem. Building is inferred from a clone
 # in /cache/work/<pkg>; quarantined from open GH Issues (if GITHUB_TOKEN
 # is set); otherwise built or missing.
-declare -A QUARANTINED  # name -> issue_number
+declare -A QUARANTINED  # name -> issue number ("" when only a local stash exists)
+declare -A REJECTED
 if [[ -n "${GITHUB_TOKEN:-}" && -n "${GITHUB_REPO:-}" ]]; then
+    # Titles look like "[QUARANTINE][<REASON>] <pkgname>" (scripts/open-quarantine-issue.sh).
     while IFS=$'\t' read -r title issue_num; do
         [[ -z "$issue_num" ]] && continue
-        # Title format: "quarantine: <pkgname> — <reason>" (see
-        # scripts/open-quarantine-issue.sh). Extract the package name.
-        pkg="${title#quarantine: }"
-        pkg="${pkg%% —*}"
-        pkg="${pkg%% -*}"
-        if [[ -n "$pkg" ]]; then
-            QUARANTINED["$pkg"]="$issue_num"
-        fi
-    done < <(curl -fsS \
+        pkg="${title##*] }"
+        [[ -n "$pkg" ]] && QUARANTINED["$pkg"]="$issue_num"
+    done < <(curl -fsS -m 8 \
         -H "Authorization: token ${GITHUB_TOKEN}" \
         -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${GITHUB_REPO}/issues?state=open&labels=quarantine/blocklist-match,quarantine/pkgbuild-deps-changed,quarantine/pkgbuild-code-changed,quarantine/pkgbuild-install-added,quarantine/pkgbuild-install-edited&per_page=100" \
-        2>/dev/null | jq -r '.[]? | [.title, (.number|tostring)] | @tsv' 2>/dev/null || true)
+        "https://api.github.com/repos/${GITHUB_REPO}/issues?state=open&labels=quarantine%2Fblocked&per_page=100" \
+        2>/dev/null | jq -r '.[]? | select(.title | startswith("[QUARANTINE]")) | [.title, (.number|tostring)] | @tsv' 2>/dev/null || true)
 fi
+# A quarantined clone on disk is authoritative even without GitHub access.
+for pkg in "${PKGS_ARR[@]}"; do
+    if [[ -n "$(quarantine_stashes "$pkg" | tail -n1)" ]]; then
+        QUARANTINED["$pkg"]="${QUARANTINED[$pkg]:-}"
+    fi
+    [[ -s "${APPROVALS_DIR}/${pkg}.rejected.json" ]] && REJECTED["$pkg"]=1
+done
 
 for pkg in "${PKGS_ARR[@]}"; do
-    if [[ -n "${QUARANTINED[$pkg]:-}" ]]; then
+    if [[ -n "${QUARANTINED[$pkg]+x}" ]]; then
         PKG_STATUS["$pkg"]="quarantined"
+    elif [[ -n "${REJECTED[$pkg]:-}" ]]; then
+        PKG_STATUS["$pkg"]="rejected"
     elif [[ -d "/cache/work/${pkg}" ]]; then
         PKG_STATUS["$pkg"]="building"
     elif [[ -n "${PKG_LOCAL_VER[$pkg]:-}" ]]; then
@@ -116,15 +127,18 @@ for pkg in "${PKGS_ARR[@]}"; do
     status="${PKG_STATUS[$pkg]:-missing}"
     issue_cell="—"
     if [[ "$status" == "quarantined" ]]; then
-        issue_num="${QUARANTINED[$pkg]:-?}"
-        issue_cell="<a href=\"https://github.com/${GITHUB_REPO}/issues/${issue_num}\">#${issue_num}</a>"
+        issue_cell="<a href=\"/cgi-bin/package.cgi?name=$(html_escape "$pkg")\"><strong>review &rarr;</strong></a>"
+        issue_num="${QUARANTINED[$pkg]:-}"
+        [[ -n "$issue_num" ]] && issue_cell+=" &middot; <a href=\"https://github.com/${GITHUB_REPO}/issues/${issue_num}\">#${issue_num}</a>"
+    elif [[ "$status" == "rejected" ]]; then
+        issue_cell="<a href=\"/cgi-bin/package.cgi?name=$(html_escape "$pkg")\">rejected &rarr;</a>"
     fi
     ood_disp="—"
     if [[ "$ood" != "null" && -n "$ood" ]]; then
         ood_disp="marked OOD"
     fi
     table_rows+="<tr>"
-    table_rows+="<td><code>$(html_escape "$pkg")</code></td>"
+    table_rows+="<td><a href=\"/cgi-bin/package.cgi?name=$(html_escape "$pkg")\"><code>$(html_escape "$pkg")</code></a></td>"
     table_rows+="<td><span class=\"status-${status}\">${status}</span></td>"
     table_rows+="<td>$(html_escape "$local_ver")</td>"
     table_rows+="<td>$(html_escape "$aur_ver")</td>"
@@ -133,8 +147,16 @@ for pkg in "${PKGS_ARR[@]}"; do
     table_rows+="</tr>"
 done
 
+review_banner=""
+n_review=0
+for pkg in "${PKGS_ARR[@]}"; do [[ "${PKG_STATUS[$pkg]:-}" == "quarantined" ]] && n_review=$((n_review+1)); done
+if (( n_review > 0 )); then
+    review_banner="<div class=\"banner\"><strong>${n_review} package(s) awaiting quarantine review</strong> &mdash; click <em>review</em> in the Quarantine column to read the PKGBUILD and approve or reject it.</div>"
+fi
+
 body=$(cat <<BODY
 <h1>aur-forge package status</h1>
+${review_banner}
 
 <p>Showing <strong>${#PKGS_ARR[@]}</strong> package(s) from <code>pkglist.txt</code>. Repo: <code>${REPO_NAME}</code>.</p>
 
@@ -146,7 +168,7 @@ body=$(cat <<BODY
 <th>Local ver</th>
 <th>AUR ver</th>
 <th>AUR flag</th>
-<th>Quarantine</th>
+<th>Review</th>
 </tr>
 </thead>
 <tbody>

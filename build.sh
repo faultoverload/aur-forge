@@ -18,6 +18,8 @@ source "${SCRIPT_DIR}/srcinfo-diff.sh"
 source "${SCRIPT_DIR}/open-quarantine-issue.sh"
 # shellcheck source=scripts/rebuild-bump.sh
 source "${SCRIPT_DIR}/rebuild-bump.sh"
+# shellcheck source=scripts/gate-lib.sh
+source "${SCRIPT_DIR}/gate-lib.sh"
 
 REPO_NAME="${REPO_NAME:-aur-forge}"
 REPO_OWNER="${REPO_OWNER:-faultoverload}"
@@ -32,11 +34,25 @@ STRICT_FIRST_BUILD="${STRICT_FIRST_BUILD:-0}"
 DRY_RUN=0
 SCAN_ONLY=0
 ONLY_PKG=""
+APPROVE_PKG=""
+REJECT_PKG=""
+EXPECT_SHA=""
+DECIDED_BY="${DECIDED_BY:-faultoverload}"
+DECISION_ISSUE="null"
+QUARANTINE_DIR="${QUARANTINE_DIR:-/cache/work-quarantine}"
 for arg in "$@"; do
     case "$arg" in
         -n|--dry-run) DRY_RUN=1 ;;
         --scan-only)  SCAN_ONLY=1 ;;
         --only=*)     ONLY_PKG="${arg#*=}" ;;
+        # Quarantine decisions (used by scripts/quarantine-decide.sh, the web UI
+        # and drain-quarantine.sh). They act on the stashed clone under
+        # QUARANTINE_DIR and exit without building.
+        --approve=*)    APPROVE_PKG="${arg#*=}" ;;
+        --reject=*)     REJECT_PKG="${arg#*=}" ;;
+        --expect-sha=*) EXPECT_SHA="${arg#*=}" ;;
+        --by=*)         DECIDED_BY="${arg#*=}" ;;
+        --issue=*)      DECISION_ISSUE="${arg#*=}" ;;
         *) echo "Unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -64,61 +80,6 @@ chown builder:builder /cache /cache/work 2>/dev/null || true
 if ! command -v archcanary >/dev/null 2>&1; then
     echo "[build] WARNING: archcanary not on PATH — blocklist check will be skipped" >&2
 fi
-
-# Helper: sha256 of a file (echoes hex digest, empty on missing).
-sha256_file() {
-    [[ -f "$1" ]] || return 0
-    sha256sum "$1" | awk '{print $1}'
-}
-
-# Helper: emit the current install-file manifest for a workdir. Stored
-# alongside the approval record so future builds can diff it.
-capture_install_manifest() {
-    (
-        cd "$1"
-        shopt -s nullglob
-        for f in *.install; do
-            [[ -f "$f" ]] || continue
-            printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f"
-        done
-    ) | sort -u | jq -R . | jq -s . 2>/dev/null || echo "[]"
-}
-
-# Helper: capture the .SRCINFO canonical form for the current PKGBUILD.
-capture_srcinfo() {
-    local workdir="$1"
-    (
-        cd "$workdir"
-        if command -v makepkg >/dev/null 2>&1; then
-            makepkg --printsrcinfo 2>/dev/null
-        else
-            # dev box without makepkg — fall back to PKGBUILD regex
-            awk -F'[ =]' '
-                /^[[:space:]]*#/ {next}
-                /^[a-z]/ {key=$1; sub(/=.*/,"",key); val=""}
-                /=/ {val=$2}
-                key {print key " = " val; key=""}
-            ' PKGBUILD
-        fi
-    )
-}
-
-# Helper: capture build()/package()/prepare() function bodies from PKGBUILD.
-# Returns a single sha256 so the approval record stays compact.
-capture_function_bodies() {
-    local workdir="$1"
-    (
-        cd "$workdir"
-        awk '
-            /^build\(\)/     {capture=1; next}
-            /^package\(\)/  {capture=1; next}
-            /^prepare\(\)/  {capture=1; next}
-            /^[a-z_][a-z0-9_]*\(\)/ && !/^(build|package|prepare)\(\)/ {capture=0}
-            capture {print}
-            /^}/ && capture {capture=0}
-        ' PKGBUILD 2>/dev/null | sha256sum | awk '{print $1}'
-    )
-}
 
 # Helper: stage quarantine details to a tmp file and invoke the issue
 # opener. Always returns (does not exit) so the caller can decide
@@ -161,45 +122,21 @@ quarantine_pkg() {
 
     echo "[build] QUARANTINE: $pkg reason=$reason" >&2
     # Move the cloned tree aside so the next build doesn't trip on it.
-    local stash="/cache/work-quarantine/${pkg}-$$"
-    mkdir -p "$(dirname "$stash")"
+    # One stash per package: the nightly scan re-quarantines a package that
+    # stays unapproved, which used to pile up one <pkg>-<pid> dir per night.
+    local stash="${QUARANTINE_DIR}/${pkg}-$$"
+    mkdir -p "$QUARANTINE_DIR"
+    discard_stashes "$pkg"
     if [[ -d "$workdir" ]]; then
         mv "$workdir" "$stash"
     fi
+    log_event "$pkg" "quarantined" "${reason}: ${notes}" "$pkgbuild_sha"
     # File the issue (no-op if GITHUB_TOKEN unset — still aborts build).
     open-quarantine-issue.sh "$pkg" "$reason" "$details_file" || \
         echo "[build] WARNING: issue opener failed for $pkg" >&2
     rm -f "$details_file"
     cd /
     return 1   # signal: do NOT build this package
-}
-
-# Approve a package: write /approvals/<pkg>.json with the current hashes.
-approve_pkg() {
-    local pkg="$1"
-    local pkgbuild_sha="$2"
-    local srcinfo_sha="$3"
-    local version="$4"
-    local issue_ref="${5:-null}"
-    local notes="${6:-first-build auto-approval after clean gate pass}"
-    local install_manifest="${7:-[]}"
-    local function_bodies="${8:-}"
-
-    write_approval "$pkg" \
-        "$pkgbuild_sha" "$srcinfo_sha" "$version" \
-        "$issue_ref" "false" "false" "$notes"
-
-    # Stash the install manifest and function-body hash in a sidecar
-    # JSON so srcinfo-diff can read them back later. Stored as
-    # /approvals/<pkg>.extras.json to keep the main approval JSON
-    # human-readable.
-    local extras="${APPROVALS_DIR}/${pkg}.extras.json"
-    jq -n \
-        --arg install_manifest "$install_manifest" \
-        --arg function_bodies  "$function_bodies" \
-        '{ install_manifest: $install_manifest, function_bodies: $function_bodies }' \
-        > "${extras}.tmp.$$"
-    mv -f "${extras}.tmp.$$" "$extras"
 }
 
 # refresh_approval — recompute hashes and update the existing approval
@@ -222,12 +159,12 @@ refresh_approval() {
         approve_pkg "$pkg" "$pkgbuild_sha" "$srcinfo_sha" "$version" \
             "$prev_issue" "approval refreshed after rebuild" \
             "$(capture_install_manifest "$workdir" | jq -c .)" \
-            "$(capture_function_bodies "$workdir")"
+            "$(capture_function_bodies "$workdir")" "false" "$workdir"
     else
         approve_pkg "$pkg" "$pkgbuild_sha" "$srcinfo_sha" "$version" \
             "null" "auto-approved on first clean build" \
             "$(capture_install_manifest "$workdir" | jq -c .)" \
-            "$(capture_function_bodies "$workdir")"
+            "$(capture_function_bodies "$workdir")" "false" "$workdir"
     fi
     echo "[build] refreshed approval for $pkg → $version"
 }
@@ -252,13 +189,28 @@ run_gate() {
     VERSION="$(grep -E '^pkgver=|^pkgrel=' "$workdir/PKGBUILD" \
         | awk -F= '{print $2}' | xargs | tr ' ' '-' || echo "unknown")"
 
+    # 0. A PKGBUILD the operator rejected stays rejected until it changes —
+    #    no new Issue every night, no build.
+    if rejection_matches "$pkg" "$PKGBUILD_SHA"; then
+        echo "[gate] $pkg: this exact PKGBUILD was rejected earlier — skipping (change upstream to trigger a new review)"
+        cd / && rm -rf "$workdir"
+        return 1
+    fi
+
     # 1. archcanary blocklist check.
     if command -v archcanary >/dev/null 2>&1; then
         local canary_out
         canary_out="$(cd "$workdir" && archcanary --search-packages="$pkg" --format=json 2>/dev/null || true)"
         ARCHCANARY_EXIT="$(cd "$workdir" && archcanary --search-packages="$pkg" --format=json >/dev/null 2>&1; echo $?)"
         ARCHCANARY_JSON="$canary_out"
-        if [[ "$ARCHCANARY_EXIT" -eq 2 ]]; then
+        if [[ "$ARCHCANARY_EXIT" -eq 2 ]] \
+           && approval_exists "$pkg" \
+           && [[ "$(approval_field "$pkg" pkgbuild_sha256)" == "$PKGBUILD_SHA" ]] \
+           && [[ "$(approval_field "$pkg" blocklist_match_at_approval)" == "true" ]]; then
+            # Explicitly approved by the operator for THIS PKGBUILD hash. A
+            # changed PKGBUILD no longer matches, so it is quarantined again.
+            echo "[gate] $pkg: archcanary list match overridden by a recorded approval of this exact PKGBUILD"
+        elif [[ "$ARCHCANARY_EXIT" -eq 2 ]]; then
             echo "[gate] $pkg: archcanary exit 2 (blocklist match)"
             quarantine_pkg "$pkg" "BLOCKLIST-MATCH" \
                 "$PKGBUILD_SHA" "$SRCINFO_SHA" "$VERSION" "$workdir" \
@@ -344,7 +296,7 @@ run_gate() {
     approve_pkg "$pkg" "$PKGBUILD_SHA" "$SRCINFO_SHA" "$VERSION" \
         "null" "auto-approved on first clean build" \
         "$(capture_install_manifest "$workdir" | jq -c .)" \
-        "$(capture_function_bodies "$workdir")"
+        "$(capture_function_bodies "$workdir")" "false" "$workdir"
     return 0
 }
 
@@ -425,6 +377,12 @@ classify_pkg_changes() {
 
     echo "$result"
 }
+
+# --- quarantine decisions ----------------------------------------------------
+if [[ -n "$APPROVE_PKG" || -n "$REJECT_PKG" ]]; then
+    if [[ -n "$APPROVE_PKG" ]]; then quarantine_decision approve "$APPROVE_PKG"; else quarantine_decision reject "$REJECT_PKG"; fi
+    exit $?
+fi
 
 # --- main loop -------------------------------------------------------------
 

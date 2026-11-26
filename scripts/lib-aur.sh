@@ -22,6 +22,20 @@
 #   cgi_html_doc <title> [body_html]
 set -euo pipefail
 
+# Variables lighttpd does not pass to CGI scripts (GITHUB_TOKEN, GITHUB_REPO,
+# REPO_NAME, ...) are written by run.sh to a root-only file; pick them up here.
+# Variables already set by the caller win, so tests and update.sh are unaffected.
+AUR_FORGE_CGI_ENV="${AUR_FORGE_CGI_ENV:-/run/aur-forge/cgi.env}"
+if [[ -r "$AUR_FORGE_CGI_ENV" ]]; then
+    while IFS= read -r _l; do
+        [[ "$_l" =~ ^export\ (GITHUB_TOKEN|GITHUB_REPO|REPO_NAME|REPO_OWNER|TZ)=(.*)$ ]] || continue
+        _n="${BASH_REMATCH[1]}"; _v="${BASH_REMATCH[2]}"
+        [[ -n "${!_n:-}" ]] && continue
+        eval "export ${_n}=${_v}"        # _v is printf %q output written by run.sh; names are allow-listed
+    done < "$AUR_FORGE_CGI_ENV"
+    unset _l _n _v
+fi
+
 # Defaults — all overridable from the caller's environment.
 REPO_NAME="${REPO_NAME:-aur-forge}"
 PKGLIST="${PKGLIST:-/pkglist}"
@@ -193,12 +207,13 @@ parse_local_versions() {
 # supplied content into the HTML body.
 # ----------------------------------------------------------------------
 html_escape() {
-    local s="${1-}"
-    s="${s//&/&amp;}"
-    s="${s//</&lt;}"
-    s="${s//>/&gt;}"
-    s="${s//\"/&quot;}"
-    printf '%s' "${s//\'/&#39;}"
+    # NOT pure parameter expansion: since bash 5.2 an unescaped "&" in the
+    # REPLACEMENT of ${var//pat/rep} means "the matched text" (patsub_replacement),
+    # so ${s//</&lt;} produced "<lt;" — i.e. it did NOT escape "<" at all (stored
+    # XSS via package names / PKGBUILD text) and turned quotes into "quot;".
+    # sed has no such feature and behaves identically on every bash.
+    printf '%s' "${1-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+                              -e 's/"/\&quot;/g' -e "s/'/\&#39;/g"
 }
 
 # ----------------------------------------------------------------------
@@ -428,6 +443,27 @@ tr:nth-child(even) td { background: var(--row-alt); }
 .status-building { color: var(--warn); }
 .status-quarantined { color: var(--err); }
 .status-missing { color: var(--err); }
+.status-rejected { color: var(--err); text-decoration: line-through; }
+.muted { color: #888; }
+.sev-high { color: var(--err); font-weight: bold; }
+.sev-medium { color: var(--warn); }
+.sev-info { color: #8ab; }
+pre.listing { padding: 0.4em 0; }
+pre.listing span { display: block; padding: 0 0.8em; white-space: pre; }
+pre.listing .ln { display: inline; padding: 0 0.6em 0 0; color: #777; user-select: none; }
+.hl-high { background: #4a1818; }
+.hl-medium { background: #4a3a10; }
+.hl-info { background: #14303f; }
+pre.diff { white-space: pre; }
+.decision { display: flex; flex-wrap: wrap; gap: 1em; }
+.decision-form { flex: 1 1 320px; }
+.decision-form.approve { border-color: var(--ok); }
+.decision-form.reject { border-color: var(--err); }
+form.inline { display: inline-block; margin: 0.3em 0; padding: 0.4em 0.8em; }
+table.facts th { width: 14em; }
+details { margin: 0.8em 0; }
+summary { cursor: pointer; color: var(--accent); }
+.banner { padding: 0.8em 1em; border: 1px solid var(--err); background: #2a1414; margin: 1em 0; }
 form { margin: 1em 0; padding: 1em; border: 1px solid var(--border); background: #181818; }
 textarea {
     width: 100%;

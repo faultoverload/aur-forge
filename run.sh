@@ -41,6 +41,25 @@ LOG_TAG="[$(date -u +%FT%TZ)]"
 /usr/local/bin/init.sh
 
 # ---------------------------------------------------------------------
+# CGI environment file
+# ---------------------------------------------------------------------
+# lighttpd hands CGI scripts a minimal environment (PATH, PKGLIST and the CSRF
+# file only), so the web UI never saw GITHUB_TOKEN / GITHUB_REPO / REPO_NAME and
+# could not talk to GitHub. `setenv.add-environment = (... => env.X)` is not an
+# option: lighttpd REFUSES TO START if X is undefined. Instead write the few
+# variables the UI needs to a root-only file that lib-aur.sh sources.
+write_cgi_env() {
+    local f="${AUR_FORGE_CGI_ENV:-/run/aur-forge/cgi.env}" v
+    mkdir -p "$(dirname "$f")"
+    ( umask 077
+      for v in GITHUB_TOKEN GITHUB_REPO REPO_NAME REPO_OWNER TZ; do
+          [[ -n "${!v:-}" ]] && printf 'export %s=%q\n' "$v" "${!v}"
+      done > "${f}.tmp" )
+    mv -f "${f}.tmp" "$f"
+}
+write_cgi_env || echo "${LOG_TAG} [run] WARNING: could not write the CGI environment file" >&2
+
+# ---------------------------------------------------------------------
 # Subprocess plumbing
 # ---------------------------------------------------------------------
 DARKHTTD_PID=""  # legacy name; now holds the lighttpd PID. Renaming would

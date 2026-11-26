@@ -120,3 +120,77 @@ remove_approval() {
     local pkg="$1"
     rm -f "${APPROVALS_DIR}/${pkg}.json"
 }
+
+# ---------------------------------------------------------------------
+# Audit trail, approved-PKGBUILD snapshots and rejections.
+# ---------------------------------------------------------------------
+# These back the web UI's package page (cgi-bin/package.cgi) and the
+# quarantine decision flow (build.sh --approve= / --reject=).
+#
+#   /approvals/<pkg>.history.jsonl   one JSON object per gate/decision event
+#   /approvals/<pkg>.snapshot/       PKGBUILD + *.install + .SRCINFO as approved,
+#                                    so a later quarantine can show a real diff
+#   /approvals/<pkg>.rejected.json   {pkgbuild_sha256, rejected_at, rejected_by}:
+#                                    that exact PKGBUILD stays rejected (no new
+#                                    Issue every night) until it changes
+
+# log_event <pkg> <event> [detail] [sha] — append one line to the history.
+log_event() {
+    local pkg="$1" event="$2" detail="${3:-}" sha="${4:-}"
+    jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg event "$event" \
+        --arg detail "$detail" --arg sha "$sha" --arg by "${APPROVED_BY:-system}" \
+        '{ts:$ts, event:$event, detail:$detail, pkgbuild_sha256:$sha, by:$by}' \
+        >> "${APPROVALS_DIR}/${pkg}.history.jsonl" 2>/dev/null || true
+}
+
+# snapshot_approval <pkg> <workdir> — keep the approved PKGBUILD + install files.
+snapshot_approval() {
+    local pkg="$1" workdir="$2" snap="${APPROVALS_DIR}/${pkg}.snapshot"
+    rm -rf "$snap"; mkdir -p "$snap"
+    local f
+    for f in PKGBUILD .SRCINFO "$workdir"/*.install; do
+        [[ "$f" == /* ]] || f="$workdir/$f"
+        [[ -f "$f" ]] && cp -f -- "$f" "$snap/" 2>/dev/null || true
+    done
+    return 0
+}
+
+# write_rejection <pkg> <pkgbuild_sha256> <by> [note]
+write_rejection() {
+    local pkg="$1" sha="$2" by="${3:-faultoverload}" note="${4:-}"
+    jq -n --arg package "$pkg" --arg sha "$sha" --arg by "$by" --arg note "$note" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{package:$package, pkgbuild_sha256:$sha, rejected_by:$by, rejected_at:$at, note:$note}' \
+        > "${APPROVALS_DIR}/${pkg}.rejected.json.tmp.$$"
+    chmod 0644 "${APPROVALS_DIR}/${pkg}.rejected.json.tmp.$$"
+    mv -f "${APPROVALS_DIR}/${pkg}.rejected.json.tmp.$$" "${APPROVALS_DIR}/${pkg}.rejected.json"
+}
+
+# rejection_matches <pkg> <sha> — true if THIS PKGBUILD was rejected before.
+rejection_matches() {
+    local f="${APPROVALS_DIR}/${1}.rejected.json"
+    [[ -s "$f" ]] && [[ "$(jq -r '.pkgbuild_sha256 // empty' "$f")" == "$2" ]]
+}
+
+clear_rejection() { rm -f "${APPROVALS_DIR}/${1}.rejected.json"; }
+
+# quarantine_stashes <pkg> — paths of quarantined clones of <pkg>, oldest first.
+# Stashes are named <pkg>-<pid>. A glob like "<pkg>-[0-9]*" would also match a
+# DIFFERENT package that happens to start with "<pkg>-<digit>", so match exactly:
+# the part after "<pkg>-" must be all digits.
+quarantine_stashes() {
+    local pkg="$1" dir="${QUARANTINE_DIR:-/cache/work-quarantine}" d n
+    for d in "$dir"/"${pkg}"-*; do
+        [[ -d "$d" ]] || continue
+        n="${d##*/}"
+        [[ "${n#"${pkg}"-}" =~ ^[0-9]+$ ]] && printf '%s\n' "$d"
+    done | sort -V
+    return 0
+}
+
+# discard_stashes <pkg> — remove every quarantined clone of <pkg>.
+discard_stashes() {
+    local d
+    while IFS= read -r d; do [[ -n "$d" ]] && rm -rf -- "$d"; done < <(quarantine_stashes "$1")
+    return 0
+}

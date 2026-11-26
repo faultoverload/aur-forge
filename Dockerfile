@@ -214,6 +214,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/build.sh \
     && ln -sf /usr/local/lib/aur-forge/prune-repo.sh          /usr/local/bin/prune-repo.sh \
     && ln -sf /usr/local/lib/aur-forge/check-abi.sh           /usr/local/bin/check-abi.sh \
     && ln -sf /usr/local/lib/aur-forge/rebuild-bump.sh        /usr/local/bin/rebuild-bump.sh \
+    && ln -sf /usr/local/lib/aur-forge/gate-lib.sh            /usr/local/bin/gate-lib.sh \
+    && ln -sf /usr/local/lib/aur-forge/pkg-analysis.sh        /usr/local/bin/pkg-analysis.sh \
+    && ln -sf /usr/local/lib/aur-forge/quarantine-decide.sh   /usr/local/bin/quarantine-decide.sh \
 # Pre-create the log directories used by lighttpd (error.log, access.log)
 # and by check.cgi's backgrounded build (check.log). Without these, the
 # file redirects in lighttpd.conf and check.cgi fail on first write and

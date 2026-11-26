@@ -347,6 +347,41 @@ first in the host and chroot mirrorlists (stock mirrors stay as fallback). Use i
 with a caching proxy such as [pacoloco](https://github.com/anatol/pacoloco) so
 every chroot refresh and `makepkg --syncdeps` is served from the LAN.
 
+## Reviewing quarantined packages (web UI)
+
+The status page (`/`) links every package to its detail page,
+`/cgi-bin/package.cgi?name=<pkg>`, and shows a banner plus a **review →** link
+for anything quarantined. The detail page has:
+
+* **Quarantine review** — why it was held, the PKGBUILD sha256, the live
+  `archcanary` verdict, static *findings* (pipe-to-shell, base64 decode, `eval`,
+  setuid, persistence, network installs at build time, skipped checksums, plain
+  `http://` sources, obfuscation, ...), a **diff against the last approved
+  PKGBUILD / `.install`**, static metadata, every URL mentioned, and the full
+  PKGBUILD (and `.install` files) with the flagged lines highlighted. Nothing on
+  this page executes the PKGBUILD. The findings are heuristics that point you at
+  lines — they are not a verdict.
+* **Decision** — *Approve and rebuild*, *Reject*, *Re-scan*. Both decisions are
+  pinned to the PKGBUILD sha256 you were shown (if the clone changed since, the
+  action is refused and you review again) and require a confirmation tick.
+  * **Approve** records that exact hash as trusted (`/approvals/<pkg>.json`,
+    plus `<pkg>.snapshot/` for future diffs), closes the GitHub Issue with a
+    comment, and rebuilds in the background. If archcanary's list flagged the
+    package, the override is stored for **that hash only**: a changed PKGBUILD is
+    quarantined again.
+  * **Reject** remembers the hash (`<pkg>.rejected.json`): it is not built and
+    does not reopen an Issue every night. A changed PKGBUILD is reviewed again;
+    an earlier approved build stays served. *Clear rejection* undoes it.
+* **Approval record**, **served files** (size, date, signature, db entry), **AUR
+  info** (maintainer, last modified, out-of-date flag, depends), **library / ABI
+  state**, an **audit history** (`<pkg>.history.jsonl`) and recent log lines.
+
+Labelling the GitHub Issue `quarantine/approved` / `quarantine/rejected` still
+works (`drain-quarantine.sh`) and goes through the same decision code
+(`build.sh --approve=<pkg>` / `--reject=<pkg>`). The UI is LAN-only
+(Traefik `internal-only`); the forms are CSRF-protected but there is no login, so
+treat access to the page as the authority to approve.
+
 ## Nightly upstream-version check
 
 `aur-forge` ships an `update` subcommand that:

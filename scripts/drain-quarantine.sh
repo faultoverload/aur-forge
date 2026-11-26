@@ -181,7 +181,13 @@ while [[ "$ISSUE_INDEX" -lt "$TOTAL" ]]; do
             continue
         fi
         BUILD_LOG="${TMPDIR_RUN}/build-${PKG}.log"
-        if "$BUILD_SH" --only="$PKG" >"$BUILD_LOG" 2>&1; then
+        # Record the approval of the quarantined PKGBUILD FIRST. Without this the
+        # rebuild re-runs the gate, sees the same drift / list match and
+        # quarantines the package again — an approval could never take effect.
+        # (If there is no stashed clone, e.g. a rebuild already approved it, the
+        # decision step is a no-op and the rebuild proceeds.)
+        "$BUILD_SH" --approve="$PKG" --by="github-label" --issue="$NUMBER" >>"$BUILD_LOG" 2>&1 || true
+        if "$BUILD_SH" --only="$PKG" >>"$BUILD_LOG" 2>&1; then
             close_issue_with_comment "$NUMBER" \
                 "$(printf '**drain-quarantine:** rebuild succeeded.\n\n```\n%s\n```' \
                     "$(tail -40 "$BUILD_LOG")")" \
@@ -200,10 +206,12 @@ while [[ "$ISSUE_INDEX" -lt "$TOTAL" ]]; do
         log "issue ${NUMBER} (${PKG}) rejected — discarding clone"
         if [[ "$DRY_RUN" -eq 0 ]]; then
             rm -rf "/cache/work/${PKG}"
-            remove_approval "$PKG"
+            # Remember the rejected PKGBUILD hash (no new Issue every night) and
+            # keep any earlier approval: the build already served stays trusted.
+            "$BUILD_SH" --reject="$PKG" --by="github-label" >/dev/null 2>&1 || true
         fi
         close_issue_with_comment "$NUMBER" \
-            "**drain-quarantine:** rejected — not building. Clone discarded, approval removed." \
+            "**drain-quarantine:** rejected — not building. This exact PKGBUILD stays rejected until it changes upstream." \
             "quarantine/rejected-done"
         continue
     fi

